@@ -30,7 +30,9 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
     private final byte[] csw = new byte[13];
     private int tag = 1;
     private volatile boolean closed;
+    private volatile boolean parked, released;
     private int stalls;
+    private int cswTimeout = DATA_TIMEOUT;
     private int lastTransferred;
     private int lun;
     private int blockSize;
@@ -244,6 +246,8 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
                     stalls++;
                     CrashLog.event("USB: el disco no respondió en " + (waited / 1000) + " s (bloqueo nº " + stalls + "), reiniciando conexión");
                     resetRecovery();
+                    Runnable stallCb = onStall;
+                    if (stallCb != null) stallCb.run();
                     throw new IOException("El disco no responde");
                 }
                 clearHalt(dirIn ? in : out);
@@ -252,10 +256,10 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
             done += rr;
             if (rr < n) break;   // paquete corto: el dispositivo no tiene más datos
         }
-        r = conn.bulkTransfer(in, csw, 13, DATA_TIMEOUT);
+        r = conn.bulkTransfer(in, csw, 13, cswTimeout);
         if (r < 0) {
             clearHalt(in);
-            r = conn.bulkTransfer(in, csw, 13, DATA_TIMEOUT);
+            r = conn.bulkTransfer(in, csw, 13, cswTimeout);
         }
         if (r != 13 || le32(csw, 0) != 0x53425355 || le32(csw, 4) != t) {
             resetRecovery();
@@ -286,33 +290,79 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
         conn.controlTransfer(0x02, 0x01, 0, e.getAddress(), null, 0, 1000);
     }
 
+    /** Resultado de la expulsión, para informar al usuario. */
+    public static final class EjectResult {
+        public boolean flushed, standby, stopped, ejected;
+        public boolean ok() { return standby || stopped; }
+        @Override public String toString() {
+            return "caché " + (flushed ? "ok" : "-") + ", STANDBY " + (standby ? "ok" : "-")
+                    + ", STOP " + (stopped ? "ok" : "-") + ", EJECT " + (ejected ? "ok" : "-");
+        }
+    }
+
+    /** Si el disco deja de responder varias veces (síntoma de falta de energía) se avisa a la pantalla. */
+    static volatile Runnable onStall;
+
     /**
-     * Expulsión segura: vacía la caché del disco, detiene el motor (aparca los cabezales) y
-     * marca el medio como expulsado. Solo después se libera la conexión USB.
+     * Expulsión segura, en este orden:
+     *  1. SYNCHRONIZE CACHE: vacía la caché del disco (norma SCSI: antes de parar el motor).
+     *  2. ATA STANDBY IMMEDIATE (vía ATA PASS-THROUGH): para el motor y aparca los cabezales. Es lo
+     *     que usa Linux porque START STOP UNIT no siempre detiene un disco tras un adaptador USB-SATA.
+     *  3. START STOP UNIT (Start=0, sin IMMED: espera a que el disco se detenga).
+     *  4. START STOP UNIT con LoEj: marca el medio como expulsado.
+     * Después NO se libera la conexión: si se soltara, Android volvería a conectar su propio driver,
+     * arrancaría el disco de nuevo y lo daría por "retirado sin seguridad" al desenchufarlo.
+     * La conexión se mantiene (en reposo, sin enviar nada) hasta que el cable se desconecte.
      */
-    public synchronized boolean stopAndEject() {
-        boolean ok = false;
+    public synchronized EjectResult stopAndPark() {
+        EjectResult r = new EjectResult();
+        cswTimeout = 30000;   // parar un disco mecánico puede tardar varios segundos
         try {
-            command(new byte[]{0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 10, null, 0, 0, true);   // SYNCHRONIZE CACHE
+            r.flushed = command(new byte[]{0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 10, null, 0, 0, true) == 0;
         } catch (IOException ignored) {
         }
-        try {   // START STOP UNIT: Start=0, LoEj=1 (detener + expulsar)
-            ok = command(new byte[]{0x1B, 0, 0, 0, 0x02, 0}, 6, null, 0, 0, true) == 0;
+        try {   // ATA PASS-THROUGH(16), protocolo "sin datos", comando E0h STANDBY IMMEDIATE
+            byte[] cb = new byte[16];
+            cb[0] = (byte) 0x85;
+            cb[1] = 0x06;
+            cb[14] = (byte) 0xE0;
+            r.standby = command(cb, 16, null, 0, 0, true) == 0;
         } catch (IOException ignored) {
         }
-        if (!ok) {
-            try {   // algunos adaptadores no aceptan LoEj: solo detener el motor
-                ok = command(new byte[]{0x1B, 0, 0, 0, 0x00, 0}, 6, null, 0, 0, true) == 0;
-            } catch (IOException ignored) {
-            }
+        try {
+            r.stopped = command(new byte[]{0x1B, 0, 0, 0, 0x00, 0}, 6, null, 0, 0, true) == 0;
+        } catch (IOException ignored) {
         }
-        close();
+        try {
+            r.ejected = command(new byte[]{0x1B, 0, 0, 0, 0x02, 0}, 6, null, 0, 0, true) == 0;
+        } catch (IOException ignored) {
+        }
+        sleep(1500);   // margen por si el adaptador respondió antes de que el eje se detuviera del todo
+        parked = true;
+        closed = true;  // a partir de aquí no se envía ningún comando más
+        CrashLog.event("Expulsión: " + r);
+        return r;
+    }
+
+    /** Compatibilidad: expulsar y soltar de inmediato (solo para discos que no se van a usar). */
+    public synchronized boolean stopAndEject() {
+        boolean ok = stopAndPark().ok();
+        release();
         return ok;
     }
 
+    public boolean isParked() { return parked; }
+
     @Override
     public void close() {
-        if (closed) return;
+        closed = true;
+        release();
+    }
+
+    /** Libera de verdad la conexión USB (cuando el cable ya se ha desconectado). */
+    public void release() {
+        if (released) return;
+        released = true;
         closed = true;
         try { conn.releaseInterface(intf); } catch (Exception ignored) { }
         try { conn.close(); } catch (Exception ignored) { }
