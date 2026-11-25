@@ -27,6 +27,8 @@ import org.videolan.libvlc.util.VLCVideoLayout;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /** Reproductor de vídeo a pantalla completa (todos los códecs vía libVLC). */
 public class VideoPlayerActivity extends Activity {
@@ -37,9 +39,15 @@ public class VideoPlayerActivity extends Activity {
     private static final float[] SPEEDS = {0.5f, 0.75f, 1f, 1.25f, 1.5f, 2f};
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+    /** Todas las operaciones de libVLC que pueden esperar al disco van aquí, nunca al hilo principal. */
+    private final ExecutorService vlc = Executors.newSingleThreadExecutor();
+    private volatile int playToken;
+    /** true mientras libVLC abre/cierra un archivo: entonces no se le pregunta nada desde la pantalla. */
+    private volatile boolean busy;
+    private boolean hw = true;
     private MediaPlayer mp;
     private VLCVideoLayout layout;
-    private ParcelFileDescriptor pfd;
+    private volatile ParcelFileDescriptor pfd;
     private List<Ntfs.Entry> list;
     private int index;
     private View controls;
@@ -53,7 +61,7 @@ public class VideoPlayerActivity extends Activity {
     };
     private final Runnable tick = new Runnable() {
         @Override public void run() {
-            if (mp != null && !dragging) {
+            if (mp != null && !dragging && !busy) {
                 long len = mp.getLength(), t = mp.getTime();
                 if (len > 0) seek.setProgress((int) (t * 1000 / len));
                 timeText.setText(Ui.time(t));
@@ -67,7 +75,16 @@ public class VideoPlayerActivity extends Activity {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         Ui.secure(this);
+        CrashLog.install(this);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        android.content.SharedPreferences sp = getSharedPreferences("diagnostico", MODE_PRIVATE);
+        hw = sp.getBoolean("hw", true);
+        boolean crashedBefore = sp.getBoolean("reproduciendo", false);
+        if (crashedBefore && hw) {   // la última reproducción no terminó bien: probar sin aceleración por hardware
+            hw = false;
+            sp.edit().putBoolean("hw", false).apply();
+            CrashLog.event("Reproducción anterior interrumpida: se activa decodificación por software");
+        }
         list = new ArrayList<Ntfs.Entry>(Session.viewerList);
         index = Session.viewerStart;
         if (list.isEmpty() || Session.current == null) { finish(); return; }
@@ -101,8 +118,16 @@ public class VideoPlayerActivity extends Activity {
             @Override public boolean onTouch(View v, MotionEvent e) { return gd.onTouchEvent(e); }
         });
 
-        mp = new MediaPlayer(Vlc.get(this));
-        mp.attachViews(layout, null, true, false);
+        try {
+            mp = new MediaPlayer(Vlc.get(this));
+            mp.attachViews(layout, null, true, false);
+        } catch (Throwable t) {
+            CrashLog.event("No se pudo iniciar el motor de vídeo: " + t);
+            msg.setText("No se pudo iniciar el motor de vídeo:\n" + t.getMessage());
+            mp = null;
+            return;
+        }
+        if (crashedBefore) msg.setText("La última vez el vídeo falló: ahora uso decodificación por software (botón «Decodif.» para cambiar)");
         mp.setEventListener(new MediaPlayer.EventListener() {
             @Override public void onEvent(final MediaPlayer.Event ev) {
                 ui.post(new Runnable() { @Override public void run() { onVlcEvent(ev.type); } });
@@ -132,6 +157,7 @@ public class VideoPlayerActivity extends Activity {
         top.addView(smallButton("Subtítulos", new View.OnClickListener() { @Override public void onClick(View v) { chooseSubs(); } }));
         top.addView(smallButton("Imagen", new View.OnClickListener() { @Override public void onClick(View v) { chooseScale(); } }));
         top.addView(smallButton("Velocidad", new View.OnClickListener() { @Override public void onClick(View v) { chooseSpeed(); } }));
+        top.addView(smallButton("Decodif.", new View.OnClickListener() { @Override public void onClick(View v) { chooseDecoder(); } }));
         f.addView(top, new FrameLayout.LayoutParams(-1, -2, Gravity.TOP));
 
         LinearLayout bottom = new LinearLayout(this);
@@ -151,7 +177,7 @@ public class VideoPlayerActivity extends Activity {
             @Override public void onStartTrackingTouch(SeekBar s) { dragging = true; ui.removeCallbacks(hideTask); }
             @Override public void onStopTrackingTouch(SeekBar s) {
                 dragging = false;
-                if (mp != null) mp.setPosition(s.getProgress() / 1000f);
+                if (mp != null && !busy) mp.setPosition(s.getProgress() / 1000f);
                 autoHide();
             }
         });
@@ -164,7 +190,7 @@ public class VideoPlayerActivity extends Activity {
         row2.addView(bigButton("−10 s", new View.OnClickListener() { @Override public void onClick(View v) { skip(-10000); } }));
         playBtn = bigButton("⏸", new View.OnClickListener() {
             @Override public void onClick(View v) {
-                if (mp == null) return;
+                if (mp == null || busy) return;
                 if (mp.isPlaying()) mp.pause(); else mp.play();
                 autoHide();
             }
@@ -212,33 +238,76 @@ public class VideoPlayerActivity extends Activity {
     }
 
     private void play() {
-        Session s = Session.current;
+        final Session s = Session.current;
         if (s == null) { finish(); return; }
-        Ntfs.Entry e = list.get(index);
+        final MediaPlayer p = mp;
+        if (p == null) return;
+        final Ntfs.Entry e = list.get(index);
         title.setText((list.size() > 1 ? (index + 1) + "/" + list.size() + "  " : "") + e.name);
-        msg.setText("");
-        mp.stop();
-        closeFd();
-        try {
-            pfd = ProxyFd.open(this, s, e);
-            Media m = new Media(Vlc.get(this), pfd.getFileDescriptor());
-            m.setHWDecoderEnabled(true, false);
-            mp.setMedia(m);
-            m.release();
-            mp.setVideoScale(SCALES[scale]);
-            mp.play();
-        } catch (IOException ex) {
-            msg.setText("No se pudo abrir el archivo");
-        }
+        msg.setText("Abriendo…");
+        final int token = ++playToken;
+        final boolean useHw = hw;
+        final android.content.Context ctx = getApplicationContext();
+        vlc.execute(new Runnable() {
+            @Override public void run() {
+                if (token != playToken) return;
+                busy = true;
+                try {
+                    p.stop();
+                    closeFd();
+                    pfd = ProxyFd.open(ctx, s, e);
+                    Media m = new Media(Vlc.get(ctx), pfd.getFileDescriptor());
+                    m.setHWDecoderEnabled(useHw, false);
+                    p.setMedia(m);
+                    m.release();
+                    markPlaying(true);
+                    CrashLog.event("Reproduciendo vídeo ." + com.usbexplorer.ntfs.core.MediaType.ext(e.name)
+                            + " (" + (e.size >> 20) + " MB, " + (useHw ? "HW" : "SW") + ")");
+                    p.play();
+                    ui.post(new Runnable() {
+                        @Override public void run() { if (mp != null) mp.setVideoScale(SCALES[scale]); }
+                    });
+                } catch (final Throwable ex) {
+                    CrashLog.event("Error al abrir vídeo: " + ex);
+                    ui.post(new Runnable() { @Override public void run() { msg.setText("No se pudo abrir el archivo"); } });
+                } finally {
+                    busy = false;
+                }
+            }
+        });
         setControls(true);
     }
 
+    private void markPlaying(boolean on) {
+        getSharedPreferences("diagnostico", MODE_PRIVATE).edit().putBoolean("reproduciendo", on).commit();
+    }
+
+    private void chooseDecoder() {
+        String[] n = {"Hardware (más fluido, menos batería)", "Software (más compatible)"};
+        Ui.show(Ui.dialog(this).setTitle("Decodificación").setSingleChoiceItems(n, hw ? 0 : 1, new DialogInterface.OnClickListener() {
+            @Override public void onClick(DialogInterface d, int w) {
+                d.dismiss();
+                boolean nhw = w == 0;
+                if (nhw == hw) return;
+                hw = nhw;
+                getSharedPreferences("diagnostico", MODE_PRIVATE).edit().putBoolean("hw", hw).apply();
+                final long t = mp != null ? mp.getTime() : 0;
+                play();
+                ui.postDelayed(new Runnable() { @Override public void run() { if (mp != null && t > 0) mp.setTime(t); } }, 1200);
+            }
+        }));
+    }
+
     private void onVlcEvent(int type) {
-        if (mp == null) return;
+        if (mp == null || busy) return;
         if (type == MediaPlayer.Event.Playing) { playBtn.setText("⏸"); msg.setText(""); }
         else if (type == MediaPlayer.Event.Paused || type == MediaPlayer.Event.Stopped) playBtn.setText("▶");
         else if (type == MediaPlayer.Event.EndReached) { if (index + 1 < list.size()) move(1); else { playBtn.setText("▶"); setControls(true); } }
-        else if (type == MediaPlayer.Event.EncounteredError) { msg.setText("Este archivo está dañado o usa un formato no compatible"); setControls(true); }
+        else if (type == MediaPlayer.Event.EncounteredError) {
+            CrashLog.event("libVLC: error de reproducción");
+            msg.setText("No se pudo reproducir: el archivo puede estar dañado, o el disco dejó de responder.");
+            setControls(true);
+        }
     }
 
     private void move(int d) {
@@ -249,7 +318,7 @@ public class VideoPlayerActivity extends Activity {
     }
 
     private void skip(long ms) {
-        if (mp == null) return;
+        if (mp == null || busy) return;
         long t = Math.max(0, mp.getTime() + ms);
         if (mp.getLength() > 0) t = Math.min(t, mp.getLength() - 500);
         mp.setTime(t);
@@ -302,29 +371,42 @@ public class VideoPlayerActivity extends Activity {
     @Override
     protected void onPause() {
         super.onPause();
+        Thumbs.get().setPaused(false);
         if (mp != null && mp.isPlaying()) mp.pause();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
-        if (Session.current == null) finish();
+        if (Session.current == null) { finish(); return; }
+        Thumbs.get().setPaused(true);
     }
 
     @Override
     protected void onDestroy() {
         super.onDestroy();
         ui.removeCallbacksAndMessages(null);
-        if (mp != null) {
-            mp.stop();
-            mp.detachViews();
-            mp.release();
-            mp = null;
+        playToken++;
+        final MediaPlayer p = mp;
+        mp = null;
+        if (p != null) {
+            try { p.detachViews(); } catch (Throwable ignored) { }
         }
-        closeFd();
+        vlc.execute(new Runnable() {
+            @Override public void run() {
+                try {
+                    if (p != null) { p.stop(); p.release(); }
+                } catch (Throwable t) {
+                    CrashLog.event("Error al cerrar el reproductor: " + t);
+                }
+                closeFd();
+                markPlaying(false);
+            }
+        });
+        vlc.shutdown();
     }
 
-    private void closeFd() {
+    private synchronized void closeFd() {
         if (pfd != null) {
             try { pfd.close(); } catch (IOException ignored) { }
             pfd = null;

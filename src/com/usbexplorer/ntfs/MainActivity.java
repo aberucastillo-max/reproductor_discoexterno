@@ -131,6 +131,7 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
             if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
                 Session s = Session.current;
                 if (s != null && (d == null || d.getDeviceName().equals(s.usb.device.getDeviceName()))) {
+                    CrashLog.event("El disco USB se desconectó sin expulsar (¿falta de energía?)");
                     Session.lost();
                     afterDiskGone();
                     Ui.show(Ui.dialog(MainActivity.this).setTitle("Disco desconectado")
@@ -154,8 +155,10 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
     protected void onCreate(Bundle b) {
         super.onCreate(b);
         Ui.secure(this);
+        CrashLog.install(this);
         usb = getSystemService(UsbManager.class);
         buildUi();
+        showLastCrash();
         IntentFilter f = new IntentFilter(ACTION_PERMISSION);
         f.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
         f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
@@ -391,6 +394,25 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
 
     private void post(Runnable r) { ui.post(r); }
 
+    /**
+     * Si la app se cerró por un error la última vez, muestra el motivo técnico. Este diálogo SÍ
+     * permite captura de pantalla (no contiene nombres de archivos) para poder enviarlo.
+     */
+    private void showLastCrash() {
+        final String r = CrashLog.lastReport(this);
+        if (r.isEmpty()) return;
+        TextView t = Ui.text(this, r, 11, Ui.TEXT, android.graphics.Typeface.MONOSPACE);
+        t.setTextIsSelectable(false);
+        t.setPadding(dp(16), dp(8), dp(16), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(t);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("La app se cerró inesperadamente la última vez")
+                .setView(sv)
+                .setPositiveButton("Cerrar", null)
+                .show();   // sin FLAG_SECURE a propósito: haz una captura y envíala para el diagnóstico
+    }
+
     // ------------------------------------------------------------------ conexión del disco
 
     private void noDiskScreen() {
@@ -507,6 +529,7 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
                     Session s = new Session(ms, disk, fs, info);
                     s.loadGroups(getApplicationContext());
                     Session.current = s;
+                    CrashLog.event("Disco montado: " + s.info + ", clúster " + fs.clusterSize + " B, sector " + disk.blockSize() + " B");
                     post(new Runnable() { @Override public void run() { opening = false; onMounted(); } });
                 } catch (final IOException e) {
                     ms.stopAndEject();

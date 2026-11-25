@@ -38,8 +38,15 @@ final class Thumbs {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private Thread worker;
     private Context app;
+    private boolean paused;
 
     private Thumbs() {}
+
+    /** Durante la reproducción de vídeo no se generan miniaturas (el disco es para el vídeo). */
+    synchronized void setPaused(boolean p) {
+        paused = p;
+        notifyAll();
+    }
 
     static boolean supports(Ntfs.Entry e) {
         if (e.dir) return false;
@@ -83,7 +90,7 @@ final class Thumbs {
         while (true) {
             Object[] job;
             synchronized (this) {
-                while (queue.isEmpty()) {
+                while (queue.isEmpty() || paused) {
                     try { wait(); } catch (InterruptedException e) { return; }
                 }
                 job = queue.pollFirst();

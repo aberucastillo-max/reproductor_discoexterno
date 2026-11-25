@@ -28,6 +28,7 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
     private final byte[] cbw = new byte[31];
     private final byte[] csw = new byte[13];
     private int tag = 1;
+    private volatile boolean closed;
     private int lastTransferred;
     private int lun;
     private int blockSize;
@@ -146,6 +147,7 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
 
     @Override
     public synchronized void readBlocks(long lba, byte[] buf, int off, int count) throws IOException {
+        if (closed) throw new IOException("El disco ya no está conectado");
         int maxBlocks = Math.max(1, MAX_XFER / blockSize);
         while (count > 0) {
             int n = Math.min(count, maxBlocks);
@@ -160,7 +162,10 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
                     sleep(200);
                 }
             }
-            if (err != null) throw err;
+            if (err != null) {
+                CrashLog.event("Lectura USB fallida (3 intentos): " + err.getMessage());
+                throw err;
+            }
             lba += n; off += n * blockSize; count -= n;
         }
     }
@@ -201,6 +206,15 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
 
     /** Ejecuta un comando SCSI. Devuelve el estado CSW (0 = correcto). */
     private int command(byte[] cb, int cbLen, byte[] data, int off, int len, boolean dirIn) throws IOException {
+        if (closed) throw new IOException("El disco ya no está conectado");
+        try {
+            return commandImpl(cb, cbLen, data, off, len, dirIn);
+        } catch (RuntimeException e) {   // la conexión se cerró a mitad (desconexión, falta de energía)
+            throw new IOException("Conexión USB perdida");
+        }
+    }
+
+    private int commandImpl(byte[] cb, int cbLen, byte[] data, int off, int len, boolean dirIn) throws IOException {
         int t = tag++;
         java.util.Arrays.fill(cbw, (byte) 0);
         le32(cbw, 0, 0x43425355);
@@ -284,6 +298,8 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
 
     @Override
     public void close() {
+        if (closed) return;
+        closed = true;
         try { conn.releaseInterface(intf); } catch (Exception ignored) { }
         try { conn.close(); } catch (Exception ignored) { }
     }

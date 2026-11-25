@@ -18,24 +18,17 @@ import java.io.IOException;
  * Solo lo usa esta propia app (reproductor y miniaturas); nunca se entrega a otras apps.
  */
 final class ProxyFd {
-    private static HandlerThread thread;
-    private static Handler handler;
-
     private ProxyFd() {}
-
-    private static synchronized Handler handler() {
-        if (thread == null) {
-            thread = new HandlerThread("usb-lectura");
-            thread.start();
-            handler = new Handler(thread.getLooper());
-        }
-        return handler;
-    }
 
     static ParcelFileDescriptor open(Context c, final Session s, Ntfs.Entry e) throws IOException {
         final Ntfs.FileHandle h = s.fs.open(e.ref);
         StorageManager sm = c.getSystemService(StorageManager.class);
-        return sm.openProxyFileDescriptor(ParcelFileDescriptor.MODE_READ_ONLY, new ProxyFileDescriptorCallback() {
+        // Un hilo propio por archivo: el vídeo, la música y las miniaturas no se bloquean entre sí.
+        final HandlerThread t = new HandlerThread("usb-lectura");
+        t.start();
+        final int[] errors = {0};
+        try {
+            return sm.openProxyFileDescriptor(ParcelFileDescriptor.MODE_READ_ONLY, new ProxyFileDescriptorCallback() {
             @Override public long onGetSize() { return h.size(); }
 
             @Override
@@ -43,13 +36,18 @@ final class ProxyFd {
                 if (s.isClosed()) throw new ErrnoException("onRead", OsConstants.EIO);
                 try {
                     return s.fs.read(h, offset, data, 0, size);
-                } catch (IOException ex) {
+                } catch (Throwable ex) {
+                    if (errors[0]++ < 5) CrashLog.event("Error leyendo del disco: " + ex.getClass().getSimpleName() + " " + ex.getMessage());
                     throw new ErrnoException("onRead", OsConstants.EIO);
                 }
             }
 
-            @Override public void onRelease() { }
-        }, handler());
+            @Override public void onRelease() { t.quitSafely(); }
+            }, new Handler(t.getLooper()));
+        } catch (IOException | RuntimeException ex) {
+            t.quitSafely();
+            throw ex instanceof IOException ? (IOException) ex : new IOException(ex.getMessage());
+        }
     }
 
     /** Lee un archivo completo (o sus primeros {@code limit} bytes) a memoria. */

@@ -15,6 +15,8 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Reproductor de música global (sigue sonando mientras navegas). Sin notificación ni controles en
@@ -27,9 +29,13 @@ final class AudioPlayer {
     static AudioPlayer get() { return INSTANCE; }
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+    /** stop/abrir/play pueden esperar al disco: nunca en el hilo principal. */
+    private final ExecutorService vlc = Executors.newSingleThreadExecutor();
+    private volatile int token;
+    private volatile boolean busy;   // abriendo/cerrando: no preguntar a libVLC desde la pantalla
     private final List<Listener> listeners = new ArrayList<Listener>();
     private MediaPlayer mp;
-    private ParcelFileDescriptor pfd;
+    private volatile ParcelFileDescriptor pfd;
     private List<Ntfs.Entry> list = new ArrayList<Ntfs.Entry>();
     private int index = -1;
     private boolean shuffle;
@@ -47,9 +53,9 @@ final class AudioPlayer {
 
     Ntfs.Entry current() { return index >= 0 && index < list.size() ? list.get(index) : null; }
     boolean active() { return mp != null && current() != null; }
-    boolean isPlaying() { return mp != null && mp.isPlaying(); }
-    long time() { return mp == null ? 0 : mp.getTime(); }
-    long length() { return mp == null ? 0 : mp.getLength(); }
+    boolean isPlaying() { return mp != null && !busy && mp.isPlaying(); }
+    long time() { return mp == null || busy ? 0 : mp.getTime(); }
+    long length() { return mp == null || busy ? 0 : mp.getLength(); }
     boolean shuffle() { return shuffle; }
 
     void play(Context c, List<Ntfs.Entry> items, int start, String groupName) {
@@ -83,28 +89,42 @@ final class AudioPlayer {
                 }
             });
         }
-        mp.stop();
-        closeFd();
         index = i;
-        try {
-            pfd = ProxyFd.open(app, s, list.get(i));
-            Media m = new Media(Vlc.get(app), pfd.getFileDescriptor());
-            mp.setMedia(m);
-            m.release();
-            mp.play();
-        } catch (IOException e) {
-            ui.post(new Runnable() { @Override public void run() { next(); } });
-        }
+        final MediaPlayer p = mp;
+        final Ntfs.Entry e = list.get(i);
+        final Session fs = s;
+        final int t = ++token;
+        vlc.execute(new Runnable() {
+            @Override public void run() {
+                if (t != token) return;
+                busy = true;
+                try {
+                    p.stop();
+                    closeFd();
+                    pfd = ProxyFd.open(app, fs, e);
+                    Media m = new Media(Vlc.get(app), pfd.getFileDescriptor());
+                    p.setMedia(m);
+                    m.release();
+                    p.play();
+                } catch (Throwable ex) {
+                    CrashLog.event("Error al abrir audio: " + ex);
+                    ui.post(new Runnable() { @Override public void run() { if (t == token) next(); } });
+                } finally {
+                    busy = false;
+                    ui.post(new Runnable() { @Override public void run() { changed(); } });
+                }
+            }
+        });
         changed();
     }
 
     void toggle() {
-        if (mp == null) return;
+        if (mp == null || busy) return;
         if (mp.isPlaying()) mp.pause(); else mp.play();
         changed();
     }
 
-    void pause() { if (mp != null && mp.isPlaying()) { mp.pause(); changed(); } }
+    void pause() { if (mp != null && !busy && mp.isPlaying()) { mp.pause(); changed(); } }
 
     void next() {
         if (index + 1 < list.size()) playIndex(index + 1);
@@ -112,21 +132,28 @@ final class AudioPlayer {
     }
 
     void prev() {
-        if (mp != null && mp.getTime() > 3000) { mp.setTime(0); return; }
+        if (mp != null && !busy && mp.getTime() > 3000) { mp.setTime(0); return; }
         if (index > 0) playIndex(index - 1);
     }
 
-    void seek(float f) { if (mp != null) mp.setPosition(f); }
+    void seek(float f) { if (mp != null && !busy) mp.setPosition(f); }
 
     void stopAll() {
         Runnable r = new Runnable() {
             @Override public void run() {
-                if (mp != null) {
-                    mp.stop();
-                    mp.release();
-                    mp = null;
-                }
-                closeFd();
+                token++;
+                final MediaPlayer p = mp;
+                mp = null;
+                vlc.execute(new Runnable() {
+                    @Override public void run() {
+                        try {
+                            if (p != null) { p.stop(); p.release(); }
+                        } catch (Throwable t) {
+                            CrashLog.event("Error al cerrar audio: " + t);
+                        }
+                        closeFd();
+                    }
+                });
                 list = new ArrayList<Ntfs.Entry>();
                 index = -1;
                 group = null;
@@ -136,7 +163,7 @@ final class AudioPlayer {
         if (Looper.myLooper() == Looper.getMainLooper()) r.run(); else ui.post(r);
     }
 
-    private void closeFd() {
+    private synchronized void closeFd() {
         if (pfd != null) {
             try { pfd.close(); } catch (IOException ignored) { }
             pfd = null;
