@@ -18,7 +18,8 @@ import java.io.IOException;
  * la API USB Host de Android. Sin root. Solo envía comandos de LECTURA.
  */
 public final class UsbMassStorage implements BlockDevice, Closeable {
-    private static final int TIMEOUT = 10000;
+    private static final int TIMEOUT = 10000;       // comandos de control (el disco puede estar arrancando)
+    private static final int DATA_TIMEOUT = 5000;   // datos: si el disco no responde en 5 s, se reinicia la conexión
     private static final int MAX_XFER = 128 * 1024;
 
     private final UsbDeviceConnection conn;
@@ -29,6 +30,7 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
     private final byte[] csw = new byte[13];
     private int tag = 1;
     private volatile boolean closed;
+    private int stalls;
     private int lastTransferred;
     private int lun;
     private int blockSize;
@@ -152,7 +154,7 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
         while (count > 0) {
             int n = Math.min(count, maxBlocks);
             IOException err = null;
-            for (int attempt = 0; attempt < 3; attempt++) {
+            for (int attempt = 0; attempt < 2; attempt++) {
                 try {
                     read(lba, buf, off, n);
                     err = null;
@@ -163,7 +165,7 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
                 }
             }
             if (err != null) {
-                CrashLog.event("Lectura USB fallida (3 intentos): " + err.getMessage());
+                CrashLog.event("Lectura USB fallida (2 intentos): " + err.getMessage());
                 throw err;
             }
             lba += n; off += n * blockSize; count -= n;
@@ -232,16 +234,28 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
         int done = 0;
         while (done < len) {
             int n = Math.min(chunk, len - done);
-            int rr = dirIn ? conn.bulkTransfer(in, data, off + done, n, TIMEOUT)
-                           : conn.bulkTransfer(out, data, off + done, n, TIMEOUT);
-            if (rr < 0) { clearHalt(dirIn ? in : out); break; }
+            long t0 = android.os.SystemClock.elapsedRealtime();
+            int rr = dirIn ? conn.bulkTransfer(in, data, off + done, n, DATA_TIMEOUT)
+                           : conn.bulkTransfer(out, data, off + done, n, DATA_TIMEOUT);
+            if (rr < 0) {
+                long waited = android.os.SystemClock.elapsedRealtime() - t0;
+                if (waited >= DATA_TIMEOUT - 200) {
+                    // el disco dejó de responder (típico de falta de energía): reiniciar y reintentar desde arriba
+                    stalls++;
+                    CrashLog.event("USB: el disco no respondió en " + (waited / 1000) + " s (bloqueo nº " + stalls + "), reiniciando conexión");
+                    resetRecovery();
+                    throw new IOException("El disco no responde");
+                }
+                clearHalt(dirIn ? in : out);
+                break;
+            }
             done += rr;
             if (rr < n) break;   // paquete corto: el dispositivo no tiene más datos
         }
-        r = conn.bulkTransfer(in, csw, 13, TIMEOUT);
+        r = conn.bulkTransfer(in, csw, 13, DATA_TIMEOUT);
         if (r < 0) {
             clearHalt(in);
-            r = conn.bulkTransfer(in, csw, 13, TIMEOUT);
+            r = conn.bulkTransfer(in, csw, 13, DATA_TIMEOUT);
         }
         if (r != 13 || le32(csw, 0) != 0x53425355 || le32(csw, 4) != t) {
             resetRecovery();

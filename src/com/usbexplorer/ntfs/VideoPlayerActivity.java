@@ -59,18 +59,39 @@ public class VideoPlayerActivity extends Activity {
     private SeekBar seek;
     private boolean dragging;
     private int scale;
+    // Estado del reproductor recibido por eventos: la pantalla NUNCA llama a libVLC para leerlo,
+    // porque libVLC puede quedarse bloqueado esperando al disco.
+    private long cTime, cLength;
+    private boolean cPlaying;
+    private float cRate = 1f;
+
+    /** Envía una orden a libVLC en su hilo propio (nunca en el hilo principal). */
+    private void vlcDo(final VlcAction a) {
+        final MediaPlayer p = mp;
+        if (p == null) return;
+        try {
+            vlc.execute(new Runnable() {
+                @Override public void run() {
+                    try { a.run(p); } catch (Throwable t) { CrashLog.event("libVLC: " + t); }
+                }
+            });
+        } catch (java.util.concurrent.RejectedExecutionException ignored) {
+        }
+    }
+
+    private interface VlcAction { void run(MediaPlayer p); }
 
     private final Runnable hideTask = new Runnable() {
         @Override public void run() {
-            if (mp != null && !busy && mp.isPlaying() && !dragging && !volBar.isDragging() && !brightBar.isDragging()) setControls(false);
+            if (mp != null && cPlaying && !dragging && !volBar.isDragging() && !brightBar.isDragging()) setControls(false);
             else autoHide();
         }
     };
     private final Runnable tick = new Runnable() {
         @Override public void run() {
             if (controls.getVisibility() == View.VISIBLE) refreshBars();
-            if (mp != null && !dragging && !busy && dragMode != SEEK) {
-                long len = mp.getLength(), t = mp.getTime();
+            if (mp != null && !dragging && dragMode != SEEK) {
+                long len = cLength, t = cTime;
                 if (len > 0) seek.setProgress((int) (t * 1000 / len));
                 timeText.setText(Ui.time(t));
                 lengthText.setText(Ui.time(len));
@@ -154,7 +175,10 @@ public class VideoPlayerActivity extends Activity {
         if (crashedBefore) msg.setText("La última vez el vídeo falló: ahora uso decodificación por software (botón «Decodif.» para cambiar)");
         mp.setEventListener(new MediaPlayer.EventListener() {
             @Override public void onEvent(final MediaPlayer.Event ev) {
-                ui.post(new Runnable() { @Override public void run() { onVlcEvent(ev.type); } });
+                final int type = ev.type;
+                final long tc = type == MediaPlayer.Event.TimeChanged ? ev.getTimeChanged() : -1;
+                final long lc = type == MediaPlayer.Event.LengthChanged ? ev.getLengthChanged() : -1;
+                ui.post(new Runnable() { @Override public void run() { onVlcEvent(type, tc, lc); } });
             }
         });
         immersive();
@@ -200,7 +224,8 @@ public class VideoPlayerActivity extends Activity {
         playBtn.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
                 if (mp == null || busy) return;
-                if (mp.isPlaying()) mp.pause(); else mp.play();
+                final boolean wasPlaying = cPlaying;
+                vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { if (wasPlaying) p.pause(); else p.play(); } });
                 autoHide();
             }
         });
@@ -274,12 +299,14 @@ public class VideoPlayerActivity extends Activity {
         seek.setPadding(Ui.dp(this, 18), Ui.dp(this, 12), Ui.dp(this, 18), Ui.dp(this, 12));
         seek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar s, int v, boolean user) {
-                if (user && mp != null && !busy) timeText.setText(Ui.time(mp.getLength() * v / 1000));
+                if (user) timeText.setText(Ui.time(cLength * v / 1000));
             }
             @Override public void onStartTrackingTouch(SeekBar s) { dragging = true; ui.removeCallbacks(hideTask); }
             @Override public void onStopTrackingTouch(SeekBar s) {
                 dragging = false;
-                if (mp != null && !busy) mp.setPosition(s.getProgress() / 1000f);
+                final float pos = s.getProgress() / 1000f;
+                cTime = (long) (cLength * pos);
+                vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setPosition(pos); } });
                 autoHide();
             }
         });
@@ -369,7 +396,7 @@ public class VideoPlayerActivity extends Activity {
 
     private void setMuted(boolean m) {
         muted = m;
-        if (mp != null && !busy) mp.setVolume(m ? 0 : 100);
+        vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setVolume(muted ? 0 : 100); } });
         muteBtn.setText(m ? "🔈" : "🔇");
         muteBtn.setAlpha(m ? 1f : 0.85f);
         showIndicator(m ? "🔇  Silencio" : "🔊  " + Math.round(currentVolume() * 100) + " %");
@@ -435,9 +462,9 @@ public class VideoPlayerActivity extends Activity {
                 float dx = e.getX() - downX, dy = e.getY() - downY;
                 if (dragMode == NONE && Math.hypot(dx, dy) > slop) {
                     if (Math.abs(dx) > Math.abs(dy)) {
-                        if (mp == null || busy || mp.getLength() <= 0) { dragMode = IGNORE; break; }
+                        if (mp == null || busy || cLength <= 0) { dragMode = IGNORE; break; }
                         dragMode = SEEK;
-                        startTime = mp.getTime();
+                        startTime = cTime;
                     } else if (downX > v.getWidth() / 2f) {
                         dragMode = VOLUME;
                         startValue = muted ? 0 : currentVolume();
@@ -449,7 +476,7 @@ public class VideoPlayerActivity extends Activity {
                     ui.removeCallbacks(hideTask);
                 }
                 if (dragMode == SEEK) {
-                    long len = mp != null ? mp.getLength() : 0;
+                    long len = cLength;
                     // un ancho de pantalla = 2 minutos (o todo el vídeo si dura menos)
                     long window = Math.min(len, 120000L);
                     long delta = (long) (dx / v.getWidth() * window);
@@ -475,7 +502,11 @@ public class VideoPlayerActivity extends Activity {
             }
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL:
-                if (dragMode == SEEK && mp != null && !busy) mp.setTime(seekTarget);
+                if (dragMode == SEEK) {
+                    final long target = seekTarget;
+                    cTime = target;
+                    vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setTime(target); } });
+                }
                 if (dragMode == SEEK || dragMode == VOLUME || dragMode == BRIGHT) {
                     hideIndicatorSoon();
                     if (controls.getVisibility() == View.VISIBLE) autoHide();
@@ -494,6 +525,7 @@ public class VideoPlayerActivity extends Activity {
         title.setText((list.size() > 1 ? (index + 1) + "/" + list.size() + "  " : "") + e.name);
         msg.setText("Abriendo…");
         final int token = ++playToken;
+        cTime = 0; cLength = 0; cPlaying = false;
         final boolean useHw = hw;
         final android.content.Context ctx = getApplicationContext();
         vlc.execute(new Runnable() {
@@ -539,16 +571,30 @@ public class VideoPlayerActivity extends Activity {
                 if (nhw == hw) return;
                 hw = nhw;
                 getSharedPreferences("diagnostico", MODE_PRIVATE).edit().putBoolean("hw", hw).apply();
-                final long t = mp != null ? mp.getTime() : 0;
+                final long t = cTime;
                 play();
-                ui.postDelayed(new Runnable() { @Override public void run() { if (mp != null && t > 0) mp.setTime(t); } }, 1200);
+                ui.postDelayed(new Runnable() {
+                    @Override public void run() {
+                        if (t > 0) vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setTime(t); } });
+                    }
+                }, 1200);
             }
         }));
     }
 
-    private void onVlcEvent(int type) {
-        if (mp == null || busy) return;
-        if (type == MediaPlayer.Event.Playing) { playBtn.setText("⏸"); msg.setText(""); if (muted) mp.setVolume(0); }
+    private void onVlcEvent(int type, long timeChanged, long lengthChanged) {
+        if (mp == null) return;
+        if (type == MediaPlayer.Event.TimeChanged) { if (dragMode != SEEK) cTime = timeChanged; return; }
+        if (type == MediaPlayer.Event.LengthChanged) { cLength = lengthChanged; return; }
+        if (type == MediaPlayer.Event.Playing) cPlaying = true;
+        else if (type == MediaPlayer.Event.Paused || type == MediaPlayer.Event.Stopped
+                || type == MediaPlayer.Event.EndReached || type == MediaPlayer.Event.EncounteredError) cPlaying = false;
+        if (busy) return;
+        if (type == MediaPlayer.Event.Playing) {
+            playBtn.setText("⏸");
+            msg.setText("");
+            if (muted) vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setVolume(0); } });
+        }
         else if (type == MediaPlayer.Event.Paused || type == MediaPlayer.Event.Stopped) playBtn.setText("▶");
         else if (type == MediaPlayer.Event.EndReached) { if (index + 1 < list.size()) move(1); else { playBtn.setText("▶"); setControls(true); } }
         else if (type == MediaPlayer.Event.EncounteredError) {
@@ -567,25 +613,39 @@ public class VideoPlayerActivity extends Activity {
 
     private void skip(long ms) {
         if (mp == null || busy) return;
-        long t = Math.max(0, mp.getTime() + ms);
-        if (mp.getLength() > 0) t = Math.min(t, mp.getLength() - 500);
-        mp.setTime(t);
+        long t = Math.max(0, cTime + ms);
+        if (cLength > 0) t = Math.min(t, cLength - 500);
+        final long target = t;
+        cTime = t;
+        vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setTime(target); } });
         indicator.setTextSize(26);
         showIndicator((ms > 0 ? "⏩  +10 s\n" : "⏪  −10 s\n") + Ui.time(t));
         hideIndicatorSoon();
     }
 
     private void chooseTrack(final boolean audio) {
-        if (mp == null) return;
-        final MediaPlayer.TrackDescription[] t = audio ? mp.getAudioTracks() : mp.getSpuTracks();
+        // las pistas se consultan en el hilo de libVLC y el diálogo se muestra después
+        vlcDo(new VlcAction() {
+            @Override public void run(MediaPlayer p) {
+                final MediaPlayer.TrackDescription[] t = audio ? p.getAudioTracks() : p.getSpuTracks();
+                final int cur = audio ? p.getAudioTrack() : p.getSpuTrack();
+                ui.post(new Runnable() { @Override public void run() { showTracks(audio, t, cur); } });
+            }
+        });
+    }
+
+    private void showTracks(final boolean audio, final MediaPlayer.TrackDescription[] t, int cur) {
+        if (isFinishing()) return;
         if (t == null || t.length == 0) { msg.setText(audio ? "Sin pistas de audio" : "Este vídeo no tiene subtítulos"); return; }
         String[] names = new String[t.length];
-        int cur = audio ? mp.getAudioTrack() : mp.getSpuTrack(), sel = -1;
+        int sel = -1;
         for (int i = 0; i < t.length; i++) { names[i] = t[i].name; if (t[i].id == cur) sel = i; }
         Ui.show(Ui.dialog(this).setTitle(audio ? "Pista de audio" : "Subtítulos")
                 .setSingleChoiceItems(names, sel, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int w) {
-                        if (audio) mp.setAudioTrack(t[w].id); else mp.setSpuTrack(t[w].id);
+                    @Override public void onClick(DialogInterface d, final int w) {
+                        vlcDo(new VlcAction() {
+                            @Override public void run(MediaPlayer p) { if (audio) p.setAudioTrack(t[w].id); else p.setSpuTrack(t[w].id); }
+                        });
                         d.dismiss();
                     }
                 }));
@@ -609,10 +669,15 @@ public class VideoPlayerActivity extends Activity {
         int sel = 2;
         for (int i = 0; i < SPEEDS.length; i++) {
             n[i] = (SPEEDS[i] == (int) SPEEDS[i] ? String.valueOf((int) SPEEDS[i]) : String.valueOf(SPEEDS[i])) + "×";
-            if (Math.abs(mp.getRate() - SPEEDS[i]) < 0.01f) sel = i;
+            if (Math.abs(cRate - SPEEDS[i]) < 0.01f) sel = i;
         }
         AlertDialog.Builder b = Ui.dialog(this).setTitle("Velocidad").setSingleChoiceItems(n, sel, new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface d, int w) { mp.setRate(SPEEDS[w]); d.dismiss(); }
+            @Override public void onClick(DialogInterface d, int w) {
+                final float r = SPEEDS[w];
+                cRate = r;
+                vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { p.setRate(r); } });
+                d.dismiss();
+            }
         });
         Ui.show(b);
     }
@@ -621,7 +686,7 @@ public class VideoPlayerActivity extends Activity {
     protected void onPause() {
         super.onPause();
         Thumbs.get().setPaused(false);
-        if (mp != null && mp.isPlaying()) mp.pause();
+        if (cPlaying) vlcDo(new VlcAction() { @Override public void run(MediaPlayer p) { if (p.isPlaying()) p.pause(); } });
     }
 
     @Override
