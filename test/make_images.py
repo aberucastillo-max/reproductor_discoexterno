@@ -100,6 +100,25 @@ def populate_frag(root):
         os.link(f"{root}/original.txt", f"{root}/enlaces/enlace_con_un_nombre_bastante_largo_{i:03d}.txt")
 
 
+def populate_names(root):
+    files = [
+        "Música/Shakira - Waka Waka.mp4", "Música/Shakira - Hips Don't Lie (Official Video).mp4",
+        "Música/SHAKIRA - LA BICICLETA.avi", "Música/Bad Bunny ft. Shakira - Chantaje Remix.mp4",
+        "Música/Bad Bunny - Tití Me Preguntó.mp4", "Música/Bad Bunny - Me Porto Bonito 1080p.mkv",
+        "Música/bad bunny - safaera.mpg", "Música/Karol G & Bad Bunny - Ahora Me Llama.mp4",
+        "Películas/Brad Pitt/Fight Club 1999.mkv", "Películas/Brad Pitt/Troya.avi", "Películas/Brad Pitt/Snatch.mp4",
+        "Películas/Brad Pitt/entrevista.mp4", "Películas/Angelina Jolie Brad Pitt Mr Smith.mp4",
+        "Videos/Entrevista Brad Pitt Cannes.mp4", "Videos/Angelina Jolie premios.mp4", "Videos/Angelina Jolie Salt.mpg",
+        "DCIM/Camera/IMG_20240101_101010.jpg", "DCIM/Camera/IMG_20240102_101010.jpg", "DCIM/Camera/IMG_20240103_101010.jpg",
+        "DCIM/Camera/VID_20240104_101010.mp4", "Fotos/Boda Ana y Luis/001.jpg", "Fotos/Boda Ana y Luis/002.jpg",
+        "Fotos/Boda Ana y Luis/003.jpg", "Fotos/Boda Ana y Luis/004.jpg", "Documentos/factura.pdf", "Documentos/notas.txt",
+    ]
+    for i, f in enumerate(files):
+        os.makedirs(os.path.dirname(f"{root}/{f}"), exist_ok=True)
+        with open(f"{root}/{f}", "wb") as h:
+            h.write(rbytes(1000 * (i + 1)))
+
+
 def reference(root):
     lines = []
     for dp, dns, fns in os.walk(root):
@@ -184,3 +203,4 @@ make("mbr512", 400, ["-c", "512", "-p", "2048"], "mbr", 512, populate_basic, com
 make("gpt4k", 400, ["-s", "4096", "-c", "65536", "-p", "256"], "gpt", 4096, populate_basic)
 make("muchos", 300, ["-c", "4096", "-p", "2048"], "mbr", 512, populate_many)
 make("frag", 200, ["-c", "4096"], "none", 512, populate_frag)
+make("nombres", 64, ["-c", "4096"], "none", 512, populate_names)

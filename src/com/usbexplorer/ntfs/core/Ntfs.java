@@ -56,14 +56,15 @@ public final class Ntfs {
     /** Elemento de una carpeta. */
     public static final class Entry {
         public final long ref;
+        public final long parent;  // referencia de la carpeta que lo contiene
         public final String name;
         public final boolean dir;
         public final long size;
         public final long mtime;   // milisegundos Unix
         public final boolean hidden;
 
-        Entry(long ref, String name, boolean dir, long size, long mtime, boolean hidden) {
-            this.ref = ref; this.name = name; this.dir = dir; this.size = size;
+        Entry(long ref, long parent, String name, boolean dir, long size, long mtime, boolean hidden) {
+            this.ref = ref; this.parent = parent; this.name = name; this.dir = dir; this.size = size;
             this.mtime = mtime; this.hidden = hidden;
         }
     }
@@ -80,6 +81,8 @@ public final class Ntfs {
     private final long base;
     public final int sectorSize, clusterSize, recordSize;
     public final long totalBytes;
+    /** Número de serie del volumen (identifica el disco para los grupos). */
+    public final long serial;
     private List<Run> mftRuns;
     private long mftSize;
     private String label = "";
@@ -98,6 +101,7 @@ public final class Ntfs {
         }
         clusterSize = sectorSize * spc;
         totalBytes = Util.s64(b, 0x28) * sectorSize;
+        serial = Util.s64(b, 0x48);
         long mftLcn = Util.s64(b, 0x30);
         int cpr = b[0x40];
         recordSize = cpr > 0 ? cpr * clusterSize : 1 << (-cpr);
@@ -157,7 +161,7 @@ public final class Ntfs {
         return true;
     }
 
-    private static List<Attr> parseAttributes(byte[] rec) throws IOException {
+    static List<Attr> parseAttributes(byte[] rec) throws IOException {
         List<Attr> list = new ArrayList<Attr>();
         int p = Util.u16(rec, 0x14);
         while (p + 8 <= rec.length) {
@@ -268,6 +272,14 @@ public final class Ntfs {
             }
         }
         return merge(attrs);
+    }
+
+    /** Número de registros de la MFT. */
+    long mftRecordCount() { return mftSize / recordSize; }
+
+    /** Lee {@code count} registros MFT consecutivos tal cual (sin aplicar fixups). */
+    void readMftRaw(long first, byte[] buf, int count) throws IOException {
+        readRuns(mftRuns, first * recordSize, buf, 0, count * recordSize);
     }
 
     // ------------------------------------------------------------------ lectura de datos
@@ -428,7 +440,7 @@ public final class Ntfs {
                     boolean dir = (fflags & 0x10000000L) != 0;
                     boolean hidden = (fflags & 0x06) != 0 || (r < 24 && name.startsWith("$"));
                     long mtime = Util.s64(b, k + 0x10) / 10000L - 11644473600000L;
-                    map.put(r + "/" + name, new Entry(ref, name, dir, Util.s64(b, k + 0x30), mtime, hidden));
+                    map.put(r + "/" + name, new Entry(ref, self, name, dir, Util.s64(b, k + 0x30), mtime, hidden));
                 }
             }
             p += el;

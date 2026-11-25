@@ -258,6 +258,30 @@ public final class UsbMassStorage implements BlockDevice, Closeable {
         conn.controlTransfer(0x02, 0x01, 0, e.getAddress(), null, 0, 1000);
     }
 
+    /**
+     * Expulsión segura: vacía la caché del disco, detiene el motor (aparca los cabezales) y
+     * marca el medio como expulsado. Solo después se libera la conexión USB.
+     */
+    public synchronized boolean stopAndEject() {
+        boolean ok = false;
+        try {
+            command(new byte[]{0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 10, null, 0, 0, true);   // SYNCHRONIZE CACHE
+        } catch (IOException ignored) {
+        }
+        try {   // START STOP UNIT: Start=0, LoEj=1 (detener + expulsar)
+            ok = command(new byte[]{0x1B, 0, 0, 0, 0x02, 0}, 6, null, 0, 0, true) == 0;
+        } catch (IOException ignored) {
+        }
+        if (!ok) {
+            try {   // algunos adaptadores no aceptan LoEj: solo detener el motor
+                ok = command(new byte[]{0x1B, 0, 0, 0, 0x00, 0}, 6, null, 0, 0, true) == 0;
+            } catch (IOException ignored) {
+            }
+        }
+        close();
+        return ok;
+    }
+
     @Override
     public void close() {
         try { conn.releaseInterface(intf); } catch (Exception ignored) { }
