@@ -56,6 +56,11 @@ public class Desugar11 {
                 for (AbstractInsnNode i : m.instructions) {
                     if (i.getOpcode() == Opcodes.INVOKEDYNAMIC) throw new IllegalStateException("invokedynamic en " + cn.name);
                 }
+                if ((m.access & Opcodes.ACC_PRIVATE) != 0 && m.name.equals("<init>")) {
+                    m.access &= ~Opcodes.ACC_PRIVATE;   // constructores privados usados por clases anidadas
+                    changed++;
+                    continue;
+                }
                 if ((m.access & Opcodes.ACC_PRIVATE) != 0 && !m.name.startsWith("<")) {
                     if (iface) throw new IllegalStateException("método privado en interfaz " + cn.name + "." + m.name);
                     if ((m.access & Opcodes.ACC_STATIC) == 0) checkNoOverride(classes, cn, m);
@@ -72,6 +77,7 @@ public class Desugar11 {
                 }
             }
         }
+        verify(classes);
         try (ZipOutputStream out = new ZipOutputStream(Files.newOutputStream(Paths.get(a[1])))) {
             for (ClassNode cn : classes.values()) {
                 ClassWriter cw = new ClassWriter(0);
@@ -87,6 +93,45 @@ public class Desugar11 {
             }
         }
         System.out.println("Clases: " + classes.size() + ", miembros privados convertidos: " + changed);
+    }
+
+    /**
+     * Comprobación final: ninguna clase puede acceder a un miembro privado de OTRA clase
+     * (en Java 11 se permitía entre clases anidadas; en Android falla con IllegalAccessError).
+     */
+    static void verify(Map<String, ClassNode> classes) {
+        int problems = 0;
+        for (ClassNode cn : classes.values()) {
+            for (MethodNode m : cn.methods) {
+                for (AbstractInsnNode i : m.instructions) {
+                    String owner = null, name = null, desc = null;
+                    boolean field = false;
+                    if (i instanceof MethodInsnNode) {
+                        MethodInsnNode mi = (MethodInsnNode) i;
+                        owner = mi.owner; name = mi.name; desc = mi.desc;
+                    } else if (i instanceof org.objectweb.asm.tree.FieldInsnNode) {
+                        org.objectweb.asm.tree.FieldInsnNode fi = (org.objectweb.asm.tree.FieldInsnNode) i;
+                        owner = fi.owner; name = fi.name; desc = fi.desc; field = true;
+                    }
+                    if (owner == null || owner.equals(cn.name)) continue;
+                    ClassNode target = classes.get(owner);
+                    if (target == null) continue;
+                    if (field) {
+                        for (FieldNode f : target.fields)
+                            if (f.name.equals(name) && f.desc.equals(desc) && (f.access & Opcodes.ACC_PRIVATE) != 0) {
+                                System.err.println("acceso privado: " + cn.name + " -> " + owner + "." + name); problems++;
+                            }
+                    } else {
+                        for (MethodNode t : target.methods)
+                            if (t.name.equals(name) && t.desc.equals(desc) && (t.access & Opcodes.ACC_PRIVATE) != 0) {
+                                System.err.println("acceso privado: " + cn.name + " -> " + owner + "." + name + desc); problems++;
+                            }
+                    }
+                }
+            }
+        }
+        if (problems > 0) throw new IllegalStateException(problems + " accesos privados entre clases sin resolver");
+        System.out.println("Verificación de accesos entre clases: OK");
     }
 
     /** Un método privado que pase a "de paquete" no debe sobrescribir ni ser sobrescrito por otro. */
