@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Crea discos NTFS de prueba con ntfs-3g y comprueba que el lector de la app
+# devuelve exactamente los mismos archivos (nombre, tamaño y SHA-256).
+# Requiere: ntfs-3g, fdisk (sfdisk), python3, JDK. Se ejecuta como root (monta FUSE).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+W=${1:-$(mktemp -d)}
+mkdir -p "$W/imgs" "$W/classes"
+python3 test/make_images.py "$W/imgs"
+javac -nowarn -d "$W/classes" src/com/usbexplorer/ntfs/core/*.java test/TestMain.java
+fail=0
+for ref in "$W"/imgs/*.ref; do
+  n=$(basename "$ref" .ref)
+  java -Dstdout.encoding=UTF-8 -cp "$W/classes" TestMain "$W/imgs/$n.img" "$(cat "$W/imgs/$n.bs")" > "$W/imgs/$n.out" 2>/dev/null
+  if diff -q "$ref" "$W/imgs/$n.out" >/dev/null; then echo "OK    $n ($(wc -l < "$ref") entradas)"; else echo "FALLO $n"; fail=1; fi
+done
+exit $fail
