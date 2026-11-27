@@ -129,13 +129,6 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
             UsbDevice d = i.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             String a = i.getAction();
             if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(a)) {
-                UsbMassStorage pk = Session.parked;
-                if (pk != null && (d == null || d.getDeviceName().equals(pk.device.getDeviceName()))) {
-                    Session.releaseParked();
-                    CrashLog.event("Disco desconectado tras expulsión segura");
-                    parkedScreenGone();
-                    return;
-                }
                 Session s = Session.current;
                 if (s != null && (d == null || d.getDeviceName().equals(s.usb.device.getDeviceName()))) {
                     CrashLog.event("El disco USB se desconectó sin expulsar (¿falta de energía?)");
@@ -186,7 +179,6 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         super.onDestroy();
         AudioPlayer.get().removeListener(this);
         unregisterReceiver(receiver);
-        watchHealth(false);
         ui.removeCallbacksAndMessages(null);
         if (isFinishing() && Session.current != null) {
             io.execute(new Runnable() { @Override public void run() { Session.eject(); } });
@@ -200,16 +192,6 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         if (stack.size() > 1) {
             stack.remove(stack.size() - 1);
             render();
-            return;
-        }
-        if (Session.parked != null) {
-            Ui.show(Ui.dialog(this).setTitle("Desconecta primero el disco")
-                    .setMessage("El disco está detenido. Si cierras la app antes de desconectarlo, Android lo volverá a "
-                            + "activar y al desenchufarlo lo dará por retirado sin seguridad.")
-                    .setPositiveButton("Esperar", null)
-                    .setNegativeButton("Salir igualmente", new DialogInterface.OnClickListener() {
-                        @Override public void onClick(DialogInterface d, int w) { finish(); }
-                    }));
             return;
         }
         if (Session.current != null) {
@@ -447,7 +429,6 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
 
     private void scan() {
         if (opening || Session.current != null) return;
-        if (Session.parked != null) { parkedScreen(); return; }
         UsbDevice target = null;
         StringBuilder sb = new StringBuilder();
         for (UsbDevice d : usb.getDeviceList().values()) {
@@ -466,54 +447,7 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
             usb.requestPermission(target, PendingIntent.getBroadcast(this, 0, i, flags));
             return;
         }
-        if (!checkAndroidMount(target)) return;
         openDevice(target);
-    }
-
-    private boolean mountWarningAccepted;
-
-    /**
-     * Si Android ya montó el disco por su cuenta (algunos Samsung montan NTFS en solo lectura),
-     * quitárselo de golpe equivale a una retirada sin seguridad. Se pide desmontarlo antes.
-     */
-    private boolean checkAndroidMount(final UsbDevice target) {
-        if (mountWarningAccepted) return true;
-        android.os.storage.StorageManager sm = getSystemService(android.os.storage.StorageManager.class);
-        String found = null;
-        boolean writable = false;
-        try {
-            for (android.os.storage.StorageVolume v : sm.getStorageVolumes()) {
-                if (!v.isRemovable() || v.isPrimary()) continue;
-                String st = v.getState();
-                String desc = String.valueOf(v.getDescription(this));
-                boolean mounted = android.os.Environment.MEDIA_MOUNTED.equals(st)
-                        || android.os.Environment.MEDIA_MOUNTED_READ_ONLY.equals(st);
-                boolean sd = desc.toLowerCase().contains("sd");
-                if (mounted && !sd) {
-                    found = desc;
-                    writable = android.os.Environment.MEDIA_MOUNTED.equals(st);
-                }
-            }
-        } catch (Exception ignored) {
-        }
-        if (found == null) return true;
-        CrashLog.event("Android tenía el disco montado (" + (writable ? "lectura/escritura" : "solo lectura") + ")");
-        Ui.show(Ui.dialog(this).setTitle("Android está usando el disco")
-                .setMessage("El sistema ha montado «" + found + "»" + (writable ? " con permiso de escritura" : " en solo lectura")
-                        + ".\n\nPara retirarlo de forma segura del sistema antes de que lo use esta app:\n"
-                        + "Ajustes → Mantenimiento del dispositivo → Almacenamiento → ⋮ → Avanzado → Almacenamiento USB → Desmontar.\n\n"
-                        + "Después vuelve aquí y pulsa «Buscar disco».")
-                .setPositiveButton("Abrir Ajustes", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int w) {
-                        try { startActivity(new Intent(android.provider.Settings.ACTION_INTERNAL_STORAGE_SETTINGS)); }
-                        catch (Exception e) { toast("Ábrelo desde Ajustes → Almacenamiento"); }
-                    }
-                })
-                .setNeutralButton(writable ? "Continuar (no recomendado)" : "Continuar", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int w) { mountWarningAccepted = true; openDevice(target); }
-                })
-                .setNegativeButton("Cancelar", null));
-        return false;
     }
 
     private static String describe(UsbDevice d) {
@@ -549,7 +483,7 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
                         if (p.isNtfs()) ntfs.add(p); else if (!"?".equals(p.fs)) other = true;
                     }
                     if (ntfs.isEmpty()) {
-                        ms.close();
+                        ms.stopAndEject();
                         StringBuilder sb = new StringBuilder("El disco (" + info + ") no tiene particiones NTFS.\n\n");
                         for (Partitions.Part p : parts) sb.append("• ").append(p).append('\n');
                         if (other) sb.append("\nEse formato Android ya lo lee directamente con «Mis archivos».");
@@ -611,8 +545,6 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         Session s = Session.current;
         diskLabel.setText((s.fs.label().isEmpty() ? "Disco NTFS" : s.fs.label()) + "\n" + s.info);
         startService(new Intent(this, DiskService.class));
-        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        watchHealth(true);
         applyPin();
         navigate(0);
         ensureIndex(null, false);
@@ -634,129 +566,31 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
             return;
         }
         final ProgressDialog pd = new ProgressDialog(this, android.R.style.Theme_DeviceDefault_Dialog_Alert);
-        pd.setMessage("Deteniendo el disco: vaciando caché, parando el motor y aparcando los cabezales…");
+        pd.setMessage("Deteniendo el disco de forma segura…");
         pd.setCancelable(false);
         Ui.show(pd);
-        exitAfterUnplug = exitAfter;
         io.execute(new Runnable() {
             @Override public void run() {
-                Session.eject();
+                final boolean ok = Session.eject();
                 post(new Runnable() {
                     @Override public void run() {
                         try { pd.dismiss(); } catch (Exception ignored) { }
                         afterDiskGone();
+                        Ui.show(Ui.dialog(MainActivity.this).setTitle(ok ? "✅ Disco detenido" : "Conexión cerrada")
+                                .setMessage(ok ? "El disco se ha detenido y ya puedes desconectarlo con seguridad."
+                                        : "El disco no confirmó la parada. Espera unos 10 segundos a que deje de girar antes de desconectarlo.")
+                                .setCancelable(false)
+                                .setPositiveButton("Aceptar", new DialogInterface.OnClickListener() {
+                                    @Override public void onClick(DialogInterface d, int w) { if (exitAfter) finish(); }
+                                }));
                     }
                 });
             }
         });
     }
 
-    private boolean exitAfterUnplug;
-
-    /** Disco detenido y sujeto por la app: pide al usuario que desconecte el cable. */
-    private void parkedScreen() {
-        UsbMassStorage.EjectResult r = Session.lastEject;
-        boolean ok = r != null && r.ok();
-        stack.clear();
-        setNav(-1);
-        titleView.setText(ok ? "✅ Ya puedes desconectar el disco" : "Desconecta el disco");
-        subtitleView.setText("El disco está detenido y en reposo");
-        toolbar.removeAllViews();
-        toolbar.addView(toolButton("↻  Volver a usar el disco", new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                Session.releaseParked();
-                message("Reactivando el disco…");
-                ui.postDelayed(new Runnable() { @Override public void run() { scan(); } }, 2500);
-            }
-        }));
-        adapter.set(new ArrayList<Row>(), true);
-        diskLabel.setText("");
-        message(ok
-                ? "El motor está parado y los cabezales aparcados. Desconecta el cable cuando quieras.\n\n"
-                  + "La app mantiene el disco en reposo hasta que lo desconectes, para que Android no lo vuelva a "
-                  + "activar. No cierres la app antes de desconectarlo."
-                : "El disco no confirmó la parada del motor. Espera unos 10 segundos a que deje de girar "
-                  + "(deja de oírse y de vibrar) y desconéctalo.\n\nNo cierres la app antes de desconectarlo.");
-    }
-
-    /** El cable se desconectó después de expulsar: retirada correcta. */
-    private void parkedScreenGone() {
-        noDiskScreen();
-        Ui.show(Ui.dialog(this).setTitle("✅ Disco retirado correctamente")
-                .setMessage("Puedes volver a conectarlo cuando quieras.")
-                .setCancelable(false)
-                .setPositiveButton("Aceptar", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int w) { if (exitAfterUnplug) finish(); }
-                }));
-    }
-
-    // ------------------------------------------------------------------ protección del disco
-
-    private BroadcastReceiver battery;
-    private boolean batteryWarned, stallWarned;
-
-    /**
-     * Vigila lo que puede dañar un disco mecánico mientras gira:
-     *  - batería baja: si la tablet se apaga, el disco pierde la corriente de golpe. Aviso al 15 % y
-     *    expulsión automática al 5 % (si no está cargando).
-     *  - bloqueos USB repetidos: síntoma de falta de energía (el disco se queda sin corriente al leer).
-     */
-    private void watchHealth(boolean on) {
-        if (on && battery == null) {
-            batteryWarned = false;
-            stallWarned = false;
-            battery = new BroadcastReceiver() {
-                @Override public void onReceive(Context c, Intent i) {
-                    int level = i.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1);
-                    int scale = i.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, 100);
-                    int plugged = i.getIntExtra(android.os.BatteryManager.EXTRA_PLUGGED, 0);
-                    if (level < 0 || Session.current == null || plugged != 0) return;
-                    int pct = level * 100 / Math.max(1, scale);
-                    if (pct <= 5) {
-                        CrashLog.event("Batería al " + pct + " %: expulsión automática");
-                        eject(false);
-                    } else if (pct <= 15 && !batteryWarned) {
-                        batteryWarned = true;
-                        Ui.show(Ui.dialog(MainActivity.this).setTitle("🔋 Batería baja (" + pct + " %)")
-                                .setMessage("Si la tablet se apaga con el disco girando, el disco pierde la corriente de golpe. "
-                                        + "Expúlsalo ahora o pon la tablet a cargar. Al 5 % la app lo expulsará sola.")
-                                .setPositiveButton("Expulsar ahora", new DialogInterface.OnClickListener() {
-                                    @Override public void onClick(DialogInterface d, int w) { eject(false); }
-                                })
-                                .setNegativeButton("Más tarde", null));
-                    }
-                }
-            };
-            registerReceiver(battery, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
-            UsbMassStorage.onStall = new Runnable() {
-                @Override public void run() {
-                    post(new Runnable() {
-                        @Override public void run() {
-                            if (stallWarned || Session.current == null) return;
-                            stallWarned = true;
-                            Ui.show(Ui.dialog(MainActivity.this).setTitle("⚠ El disco dejó de responder")
-                                    .setMessage("El disco se quedó sin responder unos segundos. Casi siempre es falta de energía: "
-                                            + "la tablet no da suficiente corriente al disco cuando lee mucho.\n\n"
-                                            + "Para protegerlo, expúlsalo y conéctalo con un hub USB-C con carga.")
-                                    .setPositiveButton("Expulsar ahora", new DialogInterface.OnClickListener() {
-                                        @Override public void onClick(DialogInterface d, int w) { eject(false); }
-                                    })
-                                    .setNegativeButton("Seguir", null));
-                        }
-                    });
-                }
-            };
-        } else if (!on && battery != null) {
-            try { unregisterReceiver(battery); } catch (Exception ignored) { }
-            battery = null;
-            UsbMassStorage.onStall = null;
-        }
-    }
-
     private void afterDiskGone() {
         stopService(new Intent(this, DiskService.class));
-        watchHealth(false);
-        getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         try { stopLockTask(); } catch (Exception ignored) { }
         selecting = false;
         selected.clear();

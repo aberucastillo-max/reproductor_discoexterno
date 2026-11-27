@@ -28,28 +28,12 @@ menú lateral, mosaicos con portada y barra de reproducción.
 
 ## Integridad del disco
 
-- **Solo lectura**: la app nunca envía comandos de escritura al disco.
-- **Expulsar disco** sigue este orden:
-  1. espera a que termine cualquier lectura en curso y detiene la reproducción;
-  2. `SYNCHRONIZE CACHE` vacía la caché del disco, como pide la norma antes de parar el motor;
-  3. ATA `STANDBY IMMEDIATE` (por ATA PASS-THROUGH) para el motor y aparca los cabezales.
-     Es el método que usa Linux, porque `START STOP UNIT` no siempre detiene un disco
-     conectado por un adaptador USB-SATA;
-  4. `START STOP UNIT` sin IMMED (espera a la parada) y después con LoEj (medio expulsado).
-- **La app sujeta el disco en reposo hasta que desconectas el cable.** Si soltara la conexión,
-  Android volvería a conectar su propio driver, arrancaría el disco otra vez y, al desenchufarlo,
-  diría que no se retiró con seguridad. La pantalla muestra «Ya puedes desconectar el disco» y,
-  al quitar el cable, «Disco retirado correctamente».
-- **Comprobación antes de abrir el disco**: si Android ya lo montó por su cuenta (algunos Samsung
-  montan NTFS en solo lectura), la app pide desmontarlo primero en Ajustes → Almacenamiento.
-- **Protección eléctrica**:
-  - si el disco deja de responder durante más de 5 s, la app reinicia la conexión y avisa
-    (es el síntoma de falta de energía) recomendando expulsarlo;
-  - con batería baja avisa al 15 % y, si no está cargando, **expulsa sola al 5 %**, para que la
-    tablet no se apague con el disco girando;
-  - la pantalla no se apaga sola mientras el disco está montado.
-- **No se cierra con el disco conectado**: Atrás pide expulsar primero y, con «Fijar app», no se
-  puede salir. Si aun así se cierra desde "recientes", el servicio interno detiene el disco.
+- **Solo lectura.** La app nunca envía comandos de escritura al disco.
+- **Expulsar disco** vacía la caché del disco y detiene el motor (SCSI SYNCHRONIZE CACHE + START STOP UNIT)
+  antes de liberar el USB. La app confirma cuándo puedes desconectarlo.
+- **No se cierra con el disco conectado.** El botón Atrás pide primero expulsar. Con «Fijar app», que
+  viene activado, Android fija la pantalla y no se puede salir de la app. Si aun así se cierra desde
+  "recientes", el servicio interno expulsa el disco antes de terminar.
 
 ## Confidencialidad
 

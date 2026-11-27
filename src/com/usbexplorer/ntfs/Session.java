@@ -54,11 +54,7 @@ final class Session {
         return index;
     }
 
-    /** Disco ya detenido que se mantiene sujeto hasta que se desconecte el cable. */
-    static volatile UsbMassStorage parked;
-    static volatile UsbMassStorage.EjectResult lastEject;
-
-    /** Expulsión segura. Devuelve true si el disco confirmó la parada del motor. */
+    /** Expulsión segura. Devuelve true si el disco confirmó la parada. */
     static boolean eject() {
         Session s;
         synchronized (Session.class) {
@@ -70,21 +66,12 @@ final class Session {
         AudioPlayer.get().stopAll();
         Thumbs.get().clear();
         viewerList = new ArrayList<Ntfs.Entry>();
-        UsbMassStorage.EjectResult r;
-        synchronized (s.usb) {   // espera a que termine cualquier lectura en curso
-            r = s.usb.stopAndPark();
+        boolean ok;
+        synchronized (s.usb) {
+            ok = s.usb.stopAndEject();
         }
-        lastEject = r;
-        parked = s.usb;
         s.disk.clearCache();
-        return r.ok();
-    }
-
-    /** El cable del disco aparcado se ha desconectado (o el usuario quiere volver a usarlo). */
-    static void releaseParked() {
-        UsbMassStorage p = parked;
-        parked = null;
-        if (p != null) p.release();
+        return ok;
     }
 
     /** El disco se desconectó sin expulsar. */
