@@ -127,6 +127,39 @@ public final class MftIndex {
 
     public int size() { return all.size(); }
 
+    private static final int MAGIC = 0x4D495832;   // "MIX2"
+
+    /** Serializa el índice (para guardarlo cifrado en la tablet). */
+    public void write(java.io.DataOutputStream o) throws IOException {
+        o.writeInt(MAGIC);
+        o.writeInt(all.size());
+        for (Ntfs.Entry e : all) {
+            o.writeLong(e.ref);
+            o.writeLong(e.parent);
+            o.writeUTF(e.name);
+            o.writeByte((e.dir ? 1 : 0) | (e.hidden ? 2 : 0));
+            o.writeLong(e.size);
+            o.writeLong(e.mtime);
+        }
+    }
+
+    public static MftIndex read(java.io.DataInputStream in) throws IOException {
+        if (in.readInt() != MAGIC) throw new IOException("Formato de índice desconocido");
+        int n = in.readInt();
+        if (n < 0 || n > 50000000) throw new IOException("Índice dañado");
+        MftIndex idx = new MftIndex();
+        for (int i = 0; i < n; i++) {
+            long ref = in.readLong(), parent = in.readLong();
+            String name = in.readUTF();
+            int f = in.readByte();
+            long size = in.readLong(), mtime = in.readLong();
+            Ntfs.Entry e = new Ntfs.Entry(ref, parent, name, (f & 1) != 0, size, mtime, (f & 2) != 0);
+            idx.byRecord.put(ref & Ntfs.MASK, e);
+            idx.all.add(e);
+        }
+        return idx;
+    }
+
     /** Busca un elemento por su referencia MFT (comprueba el número de secuencia). */
     public Ntfs.Entry get(long ref) {
         Ntfs.Entry e = byRecord.get(ref & Ntfs.MASK);

@@ -242,6 +242,9 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         }
         View spacer = new View(this);
         nav.addView(spacer, new LinearLayout.LayoutParams(1, 0, 1f));
+        TextView cacheItem = navItem("🗄", "Caché cifrada", wide);
+        cacheItem.setOnClickListener(new View.OnClickListener() { @Override public void onClick(View v) { cacheDialog(); } });
+        nav.addView(cacheItem);
         final TextView pin = navItem("📌", "Fijar app", wide);
         refreshPin(pin);
         pin.setOnClickListener(new View.OnClickListener() {
@@ -527,7 +530,19 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
                 try {
                     Ntfs fs = new Ntfs(disk, part.offset);
                     Session s = new Session(ms, disk, fs, info);
+                    s.app = getApplicationContext();
                     s.loadGroups(getApplicationContext());
+                    try {
+                        s.fingerprint = fs.fingerprint();   // unos pocos KB
+                        MftIndex cached = CacheStore.loadIndex(s.app, fs.serial, s.fingerprint);
+                        if (cached != null) {
+                            s.index = cached;
+                            s.indexFromCache = true;
+                            CrashLog.event("Índice cargado de la caché cifrada (" + cached.size() + " elementos): el disco no se reindexa");
+                        }
+                    } catch (IOException e) {
+                        CrashLog.event("No se pudo calcular la huella del disco: " + e.getMessage());
+                    }
                     Session.current = s;
                     CrashLog.event("Disco montado: " + s.info + ", clúster " + fs.clusterSize + " B, sector " + disk.blockSize() + " B");
                     post(new Runnable() { @Override public void run() { opening = false; onMounted(); } });
@@ -547,7 +562,7 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         startService(new Intent(this, DiskService.class));
         applyPin();
         navigate(0);
-        ensureIndex(null, false);
+        // El índice ya no se crea al conectar: solo cuando hace falta (Vídeos, Fotos, Música, Grupos, Buscar).
     }
 
     private void applyPin() {
@@ -556,6 +571,90 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
             if (on) startLockTask(); else stopLockTask();
         } catch (Exception ignored) {
         }
+    }
+
+    // ------------------------------------------------------------------ caché cifrada
+
+    /** Compara el contenido real de una carpeta con el índice guardado (solo refs y nombres). */
+    private static boolean matchesIndex(Session s, long folderRef, List<Ntfs.Entry> live) {
+        MftIndex idx = s.index;
+        if (idx == null) return true;
+        long folder = folderRef & 0xFFFFFFFFFFFFL;
+        java.util.HashMap<Long, Set<String>> real = new java.util.HashMap<Long, Set<String>>();
+        for (Ntfs.Entry e : live) {
+            long r = e.ref & 0xFFFFFFFFFFFFL;
+            if (r < 24) continue;   // metaarchivos de NTFS (no están en el índice)
+            Set<String> n = real.get(e.ref);
+            if (n == null) { n = new HashSet<String>(); real.put(e.ref, n); }
+            n.add(e.name);
+        }
+        int count = 0;
+        for (Ntfs.Entry e : idx.all) {
+            if (e.parent != folder) continue;
+            count++;
+            Set<String> n = real.get(e.ref);
+            if (n == null || !n.contains(e.name)) return false;
+        }
+        return count == real.size();
+    }
+
+    private void diskChanged(String why) {
+        Session s = Session.current;
+        if (s == null || !s.indexFromCache) return;
+        CrashLog.event("El disco cambió (" + why + "): se actualiza el índice");
+        s.dropIndex();
+        toast("El disco cambió desde la última vez: actualizando el índice…");
+        ensureIndex(null, false);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        if (Session.staleRequested) {
+            Session.staleRequested = false;
+            diskChanged("un archivo del índice ya no existe");
+        }
+    }
+
+    private void cacheDialog() {
+        final Session s = Session.current;
+        String text = "Para no hacer trabajar al disco en cada conexión, el índice y las miniaturas se guardan "
+                + "CIFRADOS en la tablet (AES-256-GCM, clave en el chip de seguridad, nunca sale de la tablet "
+                + "ni entra en copias de seguridad).\n\n"
+                + (s == null ? "Conecta un disco para ver sus datos." : CacheStore.stats(this, s.fs.serial)
+                + (s.index != null ? "\nEstado: " + (s.indexFromCache ? "índice leído de la caché" : "índice leído del disco") : "\nEstado: índice aún no cargado"));
+        AlertDialog.Builder b = Ui.dialog(this).setTitle("🗄 Caché cifrada").setMessage(text)
+                .setNegativeButton("Cerrar", null)
+                .setNeutralButton("Borrar toda la caché", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) { confirmClearAll(); }
+                });
+        if (s != null) {
+            b.setPositiveButton("Reindexar este disco", new DialogInterface.OnClickListener() {
+                @Override public void onClick(DialogInterface d, int w) {
+                    s.indexFromCache = true;   // fuerza diskChanged a actuar
+                    diskChanged("reindexado manual");
+                }
+            });
+        }
+        Ui.show(b);
+    }
+
+    private void confirmClearAll() {
+        Ui.show(Ui.dialog(this).setTitle("¿Borrar toda la caché?")
+                .setMessage("Se borran el índice y las miniaturas guardadas de todos los discos y se destruye su clave. "
+                        + "Los grupos no se borran. La próxima vez el disco tendrá que leerse de nuevo.")
+                .setPositiveButton("Borrar", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface d, int w) {
+                        io.execute(new Runnable() {
+                            @Override public void run() {
+                                Thumbs.get().clear();
+                                CacheStore.clearAll(getApplicationContext());
+                                post(new Runnable() { @Override public void run() { toast("Caché borrada"); } });
+                            }
+                        });
+                    }
+                })
+                .setNegativeButton("Cancelar", null));
     }
 
     // ------------------------------------------------------------------ expulsión segura
@@ -700,7 +799,14 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
                 @Override public void run() {
                     try {
                         final List<Ntfs.Entry> l = s.fs.list(sc.folder);
-                        post(new Runnable() { @Override public void run() { sc.base = l; if (top() == sc) render(); } });
+                        final boolean stale = s.indexFromCache && !matchesIndex(s, sc.folder, l);
+                        post(new Runnable() {
+                            @Override public void run() {
+                                sc.base = l;
+                                if (top() == sc) render();
+                                if (stale) diskChanged("una carpeta no coincide con el índice guardado");
+                            }
+                        });
                     } catch (final IOException e) {
                         post(new Runnable() { @Override public void run() { message("Error al leer la carpeta: " + e.getMessage()); } });
                     }

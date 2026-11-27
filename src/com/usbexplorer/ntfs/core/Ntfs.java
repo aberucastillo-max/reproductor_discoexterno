@@ -129,6 +129,40 @@ public final class Ntfs {
 
     public String label() { return label; }
 
+    /**
+     * Huella del estado del volumen leyendo solo unos KB: número de serie, posición y mapa de uso de
+     * la MFT, páginas de reinicio de $LogFile (cambian con cualquier modificación de metadatos en
+     * Windows) y los registros de $Volume (estado "sucio") y de la carpeta raíz.
+     * Si la huella coincide con la guardada, el índice en caché sigue siendo válido.
+     */
+    public byte[] fingerprint() throws IOException {
+        java.security.MessageDigest md;
+        try {
+            md = java.security.MessageDigest.getInstance("SHA-256");
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException(e);
+        }
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(16);
+        b.putLong(serial).putLong(mftSize);
+        md.update(b.array());
+        for (Run r : mftRuns) {
+            java.nio.ByteBuffer rb = java.nio.ByteBuffer.allocate(24);
+            rb.putLong(r.vcn).putLong(r.lcn).putLong(r.len);
+            md.update(rb.array());
+        }
+        Attr bitmap = find(loadAttributes(0), AT_BITMAP, "");
+        if (bitmap != null) md.update(bitmap.nonResident ? readAll(bitmap) : bitmap.value);
+        Attr log = find(loadAttributes(2), AT_DATA, "");
+        if (log != null) {
+            byte[] restart = new byte[(int) Math.min(8192, log.dataSize)];
+            read(log, 0, restart, 0, restart.length);
+            md.update(restart);
+        }
+        md.update(readRecord(3));
+        md.update(readRecord(5));
+        return md.digest();
+    }
+
     // ------------------------------------------------------------------ registros MFT
 
     byte[] readRecord(long n) throws IOException {
@@ -252,7 +286,13 @@ public final class Ntfs {
     /** Todos los atributos de un archivo, siguiendo $ATTRIBUTE_LIST si existe. */
     List<Attr> loadAttributes(long ref) throws IOException {
         long n = ref & MASK;
-        List<Attr> attrs = parseAttributes(readRecord(n));
+        byte[] rec0 = readRecord(n);
+        int seq = (int) (ref >>> 48);
+        if (seq != 0 && Util.u16(rec0, 0x10) != seq) {
+            // la referencia es de una versión anterior del disco (archivo borrado y registro reutilizado)
+            throw new IOException("El archivo ya no existe o cambió en el disco. Reindexa el disco.");
+        }
+        List<Attr> attrs = parseAttributes(rec0);
         Attr al = find(attrs, AT_ATTRIBUTE_LIST, null);
         if (al != null) {
             byte[] v = al.nonResident ? readAll(al) : al.value;

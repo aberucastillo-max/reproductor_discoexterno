@@ -20,6 +20,13 @@ final class Session {
     final Ntfs fs;
     final String info;
     volatile MftIndex index;
+    /** Huella del disco al montarlo (para validar y guardar la caché). */
+    byte[] fingerprint;
+    /** true si el índice vino de la caché de la tablet (se vigila que siga coincidiendo). */
+    volatile boolean indexFromCache;
+    Context app;
+    /** Algún componente detectó que el índice no coincide con el disco. */
+    static volatile boolean staleRequested;
     Groups groups = new Groups();
     private volatile boolean closed;
 
@@ -50,8 +57,19 @@ final class Session {
     }
 
     synchronized MftIndex index(MftIndex.Progress p) throws IOException {
-        if (index == null) index = MftIndex.build(fs, p);
+        if (index == null) {
+            index = MftIndex.build(fs, p);
+            indexFromCache = false;
+            if (app != null && fingerprint != null) CacheStore.saveIndex(app, fs.serial, fingerprint, index);
+        }
         return index;
+    }
+
+    /** Descarta el índice (y su caché) para volver a leerlo del disco. */
+    synchronized void dropIndex() {
+        index = null;
+        indexFromCache = false;
+        if (app != null) CacheStore.invalidateIndex(app, fs.serial);
     }
 
     /** Expulsión segura. Devuelve true si el disco confirmó la parada. */

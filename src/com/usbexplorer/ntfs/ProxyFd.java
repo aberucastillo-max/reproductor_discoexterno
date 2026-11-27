@@ -21,7 +21,13 @@ final class ProxyFd {
     private ProxyFd() {}
 
     static ParcelFileDescriptor open(Context c, final Session s, Ntfs.Entry e) throws IOException {
-        final Ntfs.FileHandle h = s.fs.open(e.ref);
+        final Ntfs.FileHandle h;
+        try {
+            h = s.fs.open(e.ref);
+        } catch (IOException ex) {
+            if (String.valueOf(ex.getMessage()).contains("Reindexa")) Session.staleRequested = true;
+            throw ex;
+        }
         StorageManager sm = c.getSystemService(StorageManager.class);
         // Un hilo propio por archivo: el vídeo, la música y las miniaturas no se bloquean entre sí.
         final HandlerThread t = new HandlerThread("usb-lectura");
@@ -52,7 +58,13 @@ final class ProxyFd {
 
     /** Lee un archivo completo (o sus primeros {@code limit} bytes) a memoria. */
     static byte[] readAll(Session s, Ntfs.Entry e, long limit) throws IOException {
-        Ntfs.FileHandle h = s.fs.open(e.ref);
+        Ntfs.FileHandle h;
+        try {
+            h = s.fs.open(e.ref);
+        } catch (IOException ex) {
+            if (String.valueOf(ex.getMessage()).contains("Reindexa")) Session.staleRequested = true;
+            throw ex;
+        }
         long n = Math.min(h.size(), limit);
         if (n > Integer.MAX_VALUE - 16) throw new IOException("Archivo demasiado grande");
         byte[] b = new byte[(int) n];

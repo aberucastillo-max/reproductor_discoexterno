@@ -35,6 +35,33 @@ menú lateral, mosaicos con portada y barra de reproducción.
   viene activado, Android fija la pantalla y no se puede salir de la app. Si aun así se cierra desde
   "recientes", el servicio interno expulsa el disco antes de terminar.
 
+## Caché cifrada (cuidar el disco)
+
+Para que el disco no trabaje cada vez que lo conectas:
+
+- **Huella del disco**: al conectarlo se leen solo unos KB (número de serie, mapa de la MFT,
+  páginas de reinicio de `$LogFile`, registros de `$Volume` y de la raíz). Si coincide con la
+  guardada, el índice se carga desde la tablet y **el disco no se reindexa**.
+- **No se indexa al conectar**: el índice solo se crea cuando hace falta (Vídeos, Fotos, Música,
+  Grupos, Buscar).
+- **Miniaturas ligeras**: solo de fotos, a partir de la miniatura que ya llevan dentro (se leen
+  128 KB). La foto entera solo se lee si ocupa menos de 2 MB. No se extraen fotogramas de vídeo.
+  Se generan con pausas, una sola vez por archivo, y se guardan cifradas (límite de 200 MB; se
+  borran primero las menos usadas).
+- **Autocorrección**: si al abrir una carpeta su contenido no coincide con el índice, o un archivo
+  ya no existe, el índice se actualiza solo. Cada referencia comprueba el número de secuencia NTFS,
+  así que nunca se abre un archivo equivocado. También hay un botón «Reindexar este disco».
+- **Cifrado**: la clave maestra aleatoria se guarda envuelta por una clave AES-256 generada dentro
+  del chip de seguridad (Android Keystore: StrongBox si existe, si no el TEE). Esa clave no se puede
+  extraer y solo funciona con la tablet desbloqueada. A partir de la maestra se derivan subclaves
+  por disco y propósito (HMAC-SHA256). Cada archivo usa AES-256-GCM con IV aleatorio y datos
+  asociados que lo atan a su disco y propósito. Los nombres de los archivos de la caché son HMAC
+  (no revelan disco ni archivo). Todo está en la carpeta privada sin copia de seguridad.
+  «Borrar toda la caché» destruye también la clave.
+- Lo que hace Linux (ntfs-3g) no siempre queda reflejado en `$LogFile`. Si se modifica el disco desde
+  Linux, la huella puede no cambiar y entonces actúa la autocorrección. Los cambios hechos en Windows
+  sí se detectan siempre.
+
 ## Confidencialidad
 
 | Medida | Efecto |

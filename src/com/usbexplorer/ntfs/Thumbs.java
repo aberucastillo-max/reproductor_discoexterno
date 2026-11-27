@@ -16,6 +16,7 @@ import com.usbexplorer.ntfs.core.MediaType;
 import com.usbexplorer.ntfs.core.Ntfs;
 
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.HashSet;
@@ -48,14 +49,18 @@ final class Thumbs {
         notifyAll();
     }
 
+    /**
+     * Miniaturas "ligeras" para cuidar el disco: solo fotos. No se extraen fotogramas de vídeo
+     * (obligaría a saltar por todo el archivo).
+     */
     static boolean supports(Ntfs.Entry e) {
-        if (e.dir) return false;
-        MediaType t = MediaType.of(e.name);
-        if (t == MediaType.IMAGE) return true;
-        if (t != MediaType.VIDEO) return false;
-        String x = MediaType.ext(e.name);
-        return x.equals("mp4") || x.equals("m4v") || x.equals("mov") || x.equals("3gp") || x.equals("mkv") || x.equals("webm");
+        return !e.dir && MediaType.of(e.name) == MediaType.IMAGE;
     }
+
+    /** Pausa entre miniaturas generadas leyendo el disco, para no castigar los cabezales. */
+    private static final long DISK_PAUSE_MS = 150;
+    /** Sin miniatura incrustada, solo se decodifica la foto entera si es pequeña. */
+    private static final long FULL_DECODE_MAX = 2L * 1024 * 1024;
 
     /** Carga la miniatura de {@code e} en {@code v} (si la vista sigue mostrando ese archivo). */
     void load(Context c, final Ntfs.Entry e, final ImageView v) {
@@ -102,10 +107,29 @@ final class Thumbs {
             if (b == null) {
                 Session s = Session.current;
                 if (s == null) continue;
-                try {
-                    b = MediaType.of(e.name) == MediaType.IMAGE ? image(s, e) : video(s, e);
-                } catch (Throwable t) {
-                    b = null;
+                long serial = s.fs.serial;
+                // 1) caché cifrada de la tablet: el disco no trabaja
+                byte[] stored = CacheStore.getThumb(app, serial, e.ref, e.size, e.mtime);
+                if (stored != null) {
+                    if (CacheStore.isNone(stored)) { synchronized (this) { failed.add(e.ref); } continue; }
+                    b = BitmapFactory.decodeByteArray(stored, 0, stored.length);
+                }
+                // 2) generarla leyendo el disco (una sola vez en la vida del archivo)
+                if (b == null) {
+                    try {
+                        b = image(s, e);
+                    } catch (Throwable t) {
+                        b = null;
+                    }
+                    if (Session.current != s) continue;   // expulsado mientras tanto: no guardar nada
+                    byte[] jpeg = null;
+                    if (b != null) {
+                        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+                        b.compress(Bitmap.CompressFormat.JPEG, 80, bo);
+                        jpeg = bo.toByteArray();
+                    }
+                    CacheStore.putThumb(app, serial, e.ref, e.size, e.mtime, jpeg);
+                    try { Thread.sleep(DISK_PAUSE_MS); } catch (InterruptedException ie) { return; }
                 }
                 if (b == null) { synchronized (this) { failed.add(e.ref); } continue; }
                 cache.put(e.ref, b);
@@ -121,7 +145,7 @@ final class Thumbs {
 
     static Bitmap image(Session s, Ntfs.Entry e) throws Exception {
         // 1) miniatura EXIF incrustada (solo hay que leer el principio del archivo)
-        byte[] head = ProxyFd.readAll(s, e, 256 * 1024);
+        byte[] head = ProxyFd.readAll(s, e, 128 * 1024);
         int rot = 0;
         try {
             ExifInterface ex = new ExifInterface(new ByteArrayInputStream(head));
@@ -132,8 +156,9 @@ final class Thumbs {
             }
         } catch (Exception ignored) {
         }
-        // 2) decodificar la imagen completa reducida
-        byte[] all = e.size <= head.length ? head : ProxyFd.readAll(s, e, 60L * 1024 * 1024);
+        // 2) decodificar la imagen completa reducida, solo si es pequeña
+        if (e.size > FULL_DECODE_MAX) return null;
+        byte[] all = e.size <= head.length ? head : ProxyFd.readAll(s, e, FULL_DECODE_MAX);
         BitmapFactory.Options o = new BitmapFactory.Options();
         o.inJustDecodeBounds = true;
         BitmapFactory.decodeByteArray(all, 0, all.length, o);
@@ -145,19 +170,6 @@ final class Thumbs {
         Bitmap b = BitmapFactory.decodeByteArray(all, 0, all.length, o);
         if (b == null) return null;
         return rotate(scale(b, SIZE), rot);
-    }
-
-    private Bitmap video(Session s, Ntfs.Entry e) throws Exception {
-        ParcelFileDescriptor pfd = ProxyFd.open(app, s, e);
-        MediaMetadataRetriever r = new MediaMetadataRetriever();
-        try {
-            r.setDataSource(pfd.getFileDescriptor());
-            Bitmap b = r.getScaledFrameAtTime(3_000_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, SIZE, SIZE);
-            return b;
-        } finally {
-            try { r.release(); } catch (Exception ignored) { }
-            pfd.close();
-        }
     }
 
     /** Grados de giro según la etiqueta EXIF de orientación. */

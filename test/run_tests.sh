@@ -20,4 +20,9 @@ for ref in "$W"/imgs/*.ref; do
 done
 java -Dstdout.encoding=UTF-8 -cp "$W/classes" SuggestTest "$W/imgs/nombres.img" 2>/dev/null | tee "$W/sug.txt"
 grep -q FALLO "$W/sug.txt" && fail=1
+# caché: huella, cifrado del índice, manipulación y referencias caducadas
+cp "$W/imgs/basico.img" "$W/mod.img"; mkdir -p "$W/mnt"
+ntfs-3g "$W/mod.img" "$W/mnt" && mv "$W/mnt/pequeño.txt" "$W/mnt/renombrado.txt" && umount "$W/mnt"
+java -Dstdout.encoding=UTF-8 -cp "$W/classes" CacheTest "$W/imgs/basico.img" "$W/mod.img" 2>/dev/null | tee "$W/cache.txt"
+grep -q FALLO "$W/cache.txt" && fail=1
 exit $fail
