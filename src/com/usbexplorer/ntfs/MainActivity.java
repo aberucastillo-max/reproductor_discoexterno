@@ -573,6 +573,22 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
         }
     }
 
+    /** Multivídeo: 2–4 vídeos aleatorios de todo el disco a la vez. */
+    private void openMulti() {
+        final Session s = Session.current;
+        if (s == null) return;
+        ensureIndex(new Runnable() {
+            @Override public void run() {
+                List<Ntfs.Entry> v = new ArrayList<Ntfs.Entry>();
+                for (Ntfs.Entry e : s.index.all) if (!e.dir && !e.hidden && MediaType.of(e.name) == MediaType.VIDEO) v.add(e);
+                if (v.size() < 2) { toast("Hacen falta al menos 2 vídeos en el disco"); return; }
+                Session.viewerList = v;
+                Session.viewerStart = 0;
+                startActivity(new Intent(MainActivity.this, MultiPlayerActivity.class));
+            }
+        }, true);
+    }
+
     // ------------------------------------------------------------------ caché cifrada
 
     /** Compara el contenido real de una carpeta con el índice guardado (solo refs y nombres). */
@@ -917,6 +933,9 @@ public class MainActivity extends Activity implements AudioPlayer.Listener {
                 toolbar.addView(toolButton("▶  Reproducir", new View.OnClickListener() { @Override public void onClick(View v) { playAll(sc, false); } }));
                 toolbar.addView(toolButton("🔀  Aleatorio", new View.OnClickListener() { @Override public void onClick(View v) { playAll(sc, true); } }));
             }
+        }
+        if (sc.kind == VIDEOS) {
+            toolbar.addView(toolButton("▦  Multivídeo", new View.OnClickListener() { @Override public void onClick(View v) { openMulti(); } }));
         }
         if (sc.kind == COVER) return;
         toolbar.addView(toolButton("⇅  Ordenar", new View.OnClickListener() { @Override public void onClick(View v) { sortDialog(sc); } }));

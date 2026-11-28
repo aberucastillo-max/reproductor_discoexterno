@@ -544,6 +544,12 @@ public class VideoPlayerActivity extends Activity {
                     CrashLog.event("Reproduciendo vídeo ." + com.usbexplorer.ntfs.core.MediaType.ext(e.name)
                             + " (" + (e.size >> 20) + " MB, " + (useHw ? "HW" : "SW") + ")");
                     p.play();
+                    final long startMs = Session.viewerStartMs;
+                    if (startMs > 0) {
+                        Session.viewerStartMs = 0;
+                        Thread.sleep(400);
+                        p.setTime(startMs);
+                    }
                     ui.post(new Runnable() {
                         @Override public void run() { if (mp != null) mp.setVideoScale(SCALES[scale]); }
                     });

@@ -33,6 +33,8 @@ final class Session {
     /** Lista de reproducción / visor que se pasa entre pantallas (nunca sale de la memoria). */
     static List<Ntfs.Entry> viewerList = new ArrayList<Ntfs.Entry>();
     static int viewerStart;
+    /** Posición inicial (ms) para el reproductor individual, al ampliar desde el multivídeo. */
+    static long viewerStartMs;
 
     Session(UsbMassStorage usb, Disk disk, Ntfs fs, String info) {
         this.usb = usb; this.disk = disk; this.fs = fs; this.info = info;

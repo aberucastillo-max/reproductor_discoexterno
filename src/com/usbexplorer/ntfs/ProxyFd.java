@@ -56,6 +56,99 @@ final class ProxyFd {
         }
     }
 
+    /** Memoria usada por clips cargados enteros (todas las ventanas del multivídeo). */
+    private static final java.util.concurrent.atomic.AtomicLong fullBytes = new java.util.concurrent.atomic.AtomicLong();
+
+    static long fullBudget() {
+        // como mucho un tercio de la memoria de la app para clips enteros
+        return Math.min(160L << 20, Runtime.getRuntime().maxMemory() / 3);
+    }
+
+    /**
+     * Igual que {@link #open} pero pensado para varios vídeos a la vez sin castigar al disco:
+     *  - clips pequeños (&lt;= fullMax): se leen ENTEROS de una vez, en lectura seguida, y después el
+     *    disco queda en reposo mientras se reproducen;
+     *  - el resto: se leen en bloques grandes ({@code chunk} bytes) seguidos, de modo que el cabezal
+     *    solo salta una vez por bloque en lugar de decenas de veces por segundo.
+     */
+    static ParcelFileDescriptor openBuffered(Context c, final Session s, Ntfs.Entry e, final int chunk, long fullMax)
+            throws IOException {
+        final Ntfs.FileHandle h;
+        try {
+            h = s.fs.open(e.ref);
+        } catch (IOException ex) {
+            if (String.valueOf(ex.getMessage()).contains("Reindexa")) Session.staleRequested = true;
+            throw ex;
+        }
+        final long size = h.size();
+        byte[] whole = null;
+        if (size <= fullMax && fullBytes.get() + size <= fullBudget()) {
+            whole = new byte[(int) size];
+            int pos = 0;
+            while (pos < whole.length) {
+                int r = s.fs.read(h, pos, whole, pos, Math.min(4 << 20, whole.length - pos));
+                if (r <= 0) throw new IOException("Lectura incompleta");
+                pos += r;
+            }
+            fullBytes.addAndGet(size);
+        }
+        final byte[] full = whole;
+        final byte[][] buf = {null};
+        final long[] bufStart = {-1};
+        final int[] bufLen = {0};
+        StorageManager sm = c.getSystemService(StorageManager.class);
+        final HandlerThread t = new HandlerThread("usb-lectura");
+        t.start();
+        final int[] errors = {0};
+        try {
+            return sm.openProxyFileDescriptor(ParcelFileDescriptor.MODE_READ_ONLY, new ProxyFileDescriptorCallback() {
+                @Override public long onGetSize() { return size; }
+
+                @Override
+                public int onRead(long offset, int len, byte[] data) throws ErrnoException {
+                    if (offset >= size) return 0;
+                    len = (int) Math.min(len, size - offset);
+                    if (full != null) {
+                        System.arraycopy(full, (int) offset, data, 0, len);
+                        return len;
+                    }
+                    if (s.isClosed()) throw new ErrnoException("onRead", OsConstants.EIO);
+                    try {
+                        if (buf[0] == null || offset < bufStart[0] || offset + len > bufStart[0] + bufLen[0]) {
+                            long start = offset - offset % (64 * 1024);
+                            int want = (int) Math.min(Math.max(chunk, offset + len - start), size - start);
+                            if (buf[0] == null || buf[0].length < want) buf[0] = new byte[want];
+                            int pos = 0;
+                            while (pos < want) {   // un bloque grande y seguido
+                                int r = s.fs.read(h, start + pos, buf[0], pos, Math.min(1 << 20, want - pos));
+                                if (r <= 0) break;
+                                pos += r;
+                            }
+                            bufStart[0] = start;
+                            bufLen[0] = pos;
+                        }
+                        int n = (int) Math.min(len, bufStart[0] + bufLen[0] - offset);
+                        System.arraycopy(buf[0], (int) (offset - bufStart[0]), data, 0, n);
+                        return n;
+                    } catch (Throwable ex) {
+                        if (errors[0]++ < 5) CrashLog.event("Error leyendo del disco (multivídeo): " + ex.getClass().getSimpleName());
+                        throw new ErrnoException("onRead", OsConstants.EIO);
+                    }
+                }
+
+                @Override public void onRelease() {
+                    if (full != null) fullBytes.addAndGet(-size);
+                    buf[0] = null;
+                    t.quitSafely();
+                }
+            }, new Handler(t.getLooper()));
+        } catch (IOException | RuntimeException ex) {
+            if (full != null) fullBytes.addAndGet(-size);
+            t.quitSafely();
+            throw ex instanceof IOException ? (IOException) ex : new IOException(ex.getMessage());
+        }
+    }
+
     /** Lee un archivo completo (o sus primeros {@code limit} bytes) a memoria. */
     static byte[] readAll(Session s, Ntfs.Entry e, long limit) throws IOException {
         Ntfs.FileHandle h;

@@ -35,6 +35,23 @@ menú lateral, mosaicos con portada y barra de reproducción.
   viene activado, Android fija la pantalla y no se puede salir de la app. Si aun así se cierra desde
   "recientes", el servicio interno expulsa el disco antes de terminar.
 
+## Multivídeo (2, 3 o 4 vídeos aleatorios a la vez)
+
+En **Vídeos → ▦ Multivídeo**: vídeos aleatorios de todo el disco, cada uno con sus propios
+controles (reproducir/pausa, ±10 s, deslizar para avanzar, otro aleatorio 🔀, sonido 🔊,
+ampliar ⛶ al reproductor completo en el mismo punto, cerrar ✕). Solo una ventana tiene sonido.
+Al terminar un vídeo empieza otro aleatorio. Distribuciones: 2 lado a lado, 3 (uno grande y
+dos pequeños) y 4 en cuadrícula.
+
+Para cuidar el disco:
+- **Lectura en bloques de 8 MB seguidos**: el cabezal salta una vez por bloque en lugar de
+  decenas de veces por segundo.
+- **Clips de hasta 48 MB se cargan enteros** en memoria (con un límite total). Después el disco descansa.
+- **Prueba de capacidad antes de pasar a 3 o 4**: lee 4 MB en zonas distintas del disco mientras
+  se reproduce. Si no da al menos 2 MB/s por vídeo, o una lectura tarda más de 2,5 s, no se añaden
+  ventanas y se avisa.
+- **Ventana congelada**: si un vídeo no avanza en 9 s, esa ventana se cierra sola con un aviso pequeño.
+
 ## Caché cifrada (cuidar el disco)
 
 Para que el disco no trabaje cada vez que lo conectas:
